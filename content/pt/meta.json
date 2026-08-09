@@ -3,21 +3,21 @@
   "pages": [
     "overview",
     "quickstart",
-    "---Architecture",
-    "[architecture]architecture",
+    "---Arquitetura",
+    "architecture",
     "---Rules Engine",
-    "[rules]rules",
+    "rules",
     "---Plugins",
-    "[plugins]plugins",
+    "plugins",
     "---IA",
-    "[ai]ai",
+    "ai",
     "---CLI",
-    "[cli]cli",
+    "cli",
     "---Configuração",
-    "[config]config",
+    "config",
     "---Sentry Auto",
-    "[auto]auto",
+    "auto",
     "---Deploy",
-    "[deploy]deploy"
+    "deploy"
   ]
 }

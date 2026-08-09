@@ -1,50 +1,4 @@
-import { Mermaid } from '@/components/mermaid';
 import { i18n } from '@/lib/i18n';
-
-const pipelineDiagram = `flowchart TB
-    subgraph Sources[Camada de Fontes — Plugins]
-        N1[Nginx Access Log]
-        N2[HTTP Proxy]
-        N3[TCP Capture]
-        N4[Syslog]
-        N5[Cloudflare Logs]
-    end
-
-    subgraph Core[Core Sentry]
-        ING[Ingestor]
-        PIPE[Pipeline de Análise]
-        AI[Motor de IA]
-        HEUR[Heurísticas/Regras]
-        ROUTE[Validador de Rotas]
-        RISK[Score de Risco]
-        DECID[Decisor / Política]
-    end
-
-    subgraph Actions[Camada de Ações — Plugins]
-        A1[Block IP]
-        A2[Rate Limit]
-        A3[Cloudflare Challenge]
-        A4[Alerta Webhook]
-        A5[Log/Store]
-    end
-
-    subgraph Storage[Persistência]
-        DB[(Postgres)]
-        BL[(Blocklist state)]
-    end
-
-    Sources --> ING
-    ING --> PIPE
-    PIPE --> HEUR
-    PIPE --> AI
-    PIPE --> ROUTE
-    HEUR --> RISK
-    AI --> RISK
-    ROUTE --> RISK
-    RISK --> DECID
-    DECID --> Actions
-    Actions --> Storage
-    DECID --> Storage`;
 
 function HeroContent({ lang }: { lang: string }) {
   const isPt = lang === 'pt';
@@ -102,10 +56,6 @@ export default async function HomePage({
             {content.secondaryCta}
           </a>
         </div>
-      </div>
-
-      <div className="mx-auto max-w-5xl">
-        <Mermaid chart={pipelineDiagram} />
       </div>
     </main>
   );

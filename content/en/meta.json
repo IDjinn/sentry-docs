@@ -4,20 +4,20 @@
     "overview",
     "quickstart",
     "---Architecture",
-    "[architecture]architecture",
+    "architecture",
     "---Rules Engine",
-    "[rules]rules",
+    "rules",
     "---Plugins",
-    "[plugins]plugins",
+    "plugins",
     "---AI",
-    "[ai]ai",
+    "ai",
     "---CLI",
-    "[cli]cli",
+    "cli",
     "---Configuration",
-    "[config]config",
+    "config",
     "---Sentry Auto",
-    "[auto]auto",
+    "auto",
     "---Deploy",
-    "[deploy]deploy"
+    "deploy"
   ]
 }
