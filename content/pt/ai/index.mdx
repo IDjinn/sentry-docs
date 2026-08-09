@@ -1,0 +1,59 @@
+---
+title: "Camadas de Detecção"
+description: "Heurísticas → ONNX → LLM"
+---
+
+# Camadas de Detecção
+
+O Sentry combina três camadas de detecção em cascata: heurísticas
+determinísticas (rápidas, zero falso-positivo conhecido), um modelo ONNX
+local (para o desconhecido), e um LLM opcional sob demanda (para payloads
+complexos sem verdict claro).
+
+<Mermaid chart={`
+flowchart TB
+    E[Evento] --> L0{Heurística rápida}
+    L0 -->|benigno claro| OK[Allow rápido]
+    L0 -->|malicioso claro| BLK[Block rápido]
+    L0 -->|incerto| L1[Embeddings + modelo ONNX]
+    L1 --> L2{Confiança > threshold?}
+    L2 -->|sim| DEC[Usar verdict IA]
+    L2 -->|não| L3[LLM opcional - prompt enxuto]
+    L3 --> DEC
+`} />
+
+## Camada 0 — Heurísticas
+
+Sempre roda, ~µs. Regex de SQLi/XSS/path traversal, allowlist de ASN,
+reputation IP local. 9 detectores em `sentry-core/src/heuristics.rs`:
+
+- SQLi
+- XSS
+- PathTraversal
+- LFI
+- Log4Shell
+- CmdInjection
+- SensitivePath
+- BadCrawler
+- EmptyUserAgent
+
+Heurísticas rodam sobre a forma **URL-decodificada** do path/query
+(`heuristics::http_text`), para que payloads encodados (`%27` = `'`, `+`
+ou `%20` = espaço) não façam bypass.
+
+## Camada 1 — Modelo ONNX local
+
+Classificador treinado em payloads maliciosos (SQLi, XSS, RCE, log4shell).
+Treinamento offline, modelo versionado em `models/`. Inferência local sem
+depender de API externa.
+
+## Camada 2 — LLM sob demanda (opcional, custo alto)
+
+Só para eventos Medium sem verdict claro; prompt curto com path+headers+
+payload truncado. Resposta estruturada via JSON schema. Provider-agnostic
+via trait `LlmProvider`.
+
+## Retreinamento
+
+Pipeline offline consome incidentes confirmados → novo modelo →
+`sentry model reload`.

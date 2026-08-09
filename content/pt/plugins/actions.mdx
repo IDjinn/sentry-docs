@@ -1,0 +1,52 @@
+---
+title: "Trait de Action"
+description: "Plugins de ação — block, webhook, log"
+---
+
+# Trait de Action
+
+Toda ação (block, challenge, webhook, log) é um plugin por trás do trait
+`Action`. O decisor invoca as actions registradas para um evento quando o
+veredito difere de `Allow`.
+
+```rust
+// sentry-core/src/action.rs
+#[async_trait]
+pub trait Action: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn execute(&self, evt: &Event, decision: &Decision) -> anyhow::Result<()>;
+}
+```
+
+## Implementações
+
+| Crate                          | Ação                          | Status  |
+|--------------------------------|-------------------------------|---------|
+| `sentry-action-cloudflare`     | Regras de firewall, challenge | Pronto  |
+| `sentry-action-blocklist`      | Estado local (para inline proxy) | Pronto  |
+| `sentry-action-webhook`        | Discord/Slack/Telegram/email  | Pronto  |
+| `sentry-action-iptables`       | nftables/iptables (Linux)     | Futuro  |
+| `sentry-action-log`            | Registrar em DB               | Pronto  |
+
+## Type-safe via `ActionKind`
+
+O tipo de action em config é o enum `sentry_core::config::ActionKind`
+(`Cloudflare` | `Challenge` | `Webhook` | `Blocklist` | `Log`), **não** uma
+string. Erros de digitação em `type = "..."` no TOML falham em tempo de
+carga, não em runtime.
+
+## Actions de edge vs não-edge
+
+- **Edge actions** (block/challenge/rate-limit em CDN/WAF): use a forma
+  canonical `type = "challenge"` + `provider = "cloudflare"`. O alias
+  `type = "cloudflare"` (sem `provider`) é equivalente e mantido por
+  compatibilidade.
+- **Actions não-edge** (webhook, blocklist, log): variante do `ActionKind` e
+  braço no `match` de `daemon::build_registry`.
+
+## Registro no daemon
+
+Actions são montadas no `daemon::build_registry` a partir da config. Cada
+`[[action]]` no `sentry.toml` vira um braço no `match` que instancia o
+plugin correspondente. Adicionar uma nova action não-edge = adicionar
+variante ao `ActionKind` + braço no match.

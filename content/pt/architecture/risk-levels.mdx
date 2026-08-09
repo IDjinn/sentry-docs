@@ -1,0 +1,41 @@
+---
+title: "Níveis de Risco e Vereditos"
+description: "Score, níveis e vereditos padrão"
+---
+
+# Níveis de Risco e Vereditos
+
+O scorer combina os sinais das heurísticas, IA e validador de rotas em um
+`risk_score` (0–100) e um `risk_level`. O decisor então mapeia o nível para
+um veredito padrão, aplicável por política.
+
+| Score  | Level    | Cor       | Veredito padrão                  |
+|--------|----------|-----------|----------------------------------|
+| 0–9    | Info     | cinza     | Allow                            |
+| 10–29  | Low      | azul      | Allow + observação               |
+| 30–49  | Medium   | amarelo   | Rate-limit crescente             |
+| 50–74  | High     | laranja   | Challenge (Cloudflare)           |
+| 75–100 | Critical | vermelho  | Block IP + alerta                |
+
+Política configurável por rota/IP-range/ASN. Ex: `/admin/*` tem threshold
+mais baixo.
+
+## Pesos iniciais dos sinais
+
+| Sinal                         | Peso | Acumula? |
+|-------------------------------|------|----------|
+| SQLi (regex)                  | 60   | não      |
+| XSS (regex)                   | 45   | não      |
+| Path traversal (`../`, `%2e`) | 40   | sim      |
+| Log4Shell (`${jndi:`)         | 80   | não      |
+| RCE/cmd injection             | 70   | não      |
+| Rota inexistente              | 8    | sim      |
+| >10 404/IP em 60s             | 35   | —        |
+| User-agent vazio/suspeito    | 10   | sim      |
+| Tor exit node                 | 15   | —        |
+| IP em reputation feed         | 50   | —        |
+| Anomalia ONNX > 0.8           | 50   | não      |
+| Acesso a path sensível        | 30   | sim      |
+
+Pesos combinam (soma com cap 100), com bônus para repetição em janela.
+**Tudo ajustável em config.**

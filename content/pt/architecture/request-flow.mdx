@@ -1,0 +1,82 @@
+---
+title: "Fluxo de uma Requisição"
+description: "Sequência de estágios do log à ação"
+---
+
+# Fluxo de uma Requisição
+
+Quando uma linha de access log chega, o Sentry a normaliza em um `Event`,
+envia ao pipeline, que faz fan-out paralelo para heurísticas, IA e validador
+de rotas. Os resultados convergem no scorer, que produz um `AnalysisResult`.
+O decisor aplica a política e despacha para as actions.
+
+<Mermaid chart={`
+sequenceDiagram
+    participant N as Nginx (log)
+    participant I as Ingestor
+    participant P as Pipeline
+    participant H as Heurísticas
+    participant A as IA (ONNX)
+    participant R as Roteiro (rotas válidas)
+    participant S as Scorer
+    participant D as Decisor
+    participant CF as Cloudflare API
+    participant DB as SQLite
+
+    N->>I: linha de access_log
+    I->>I: parse + normalizar p/ Event
+    I->>P: Event
+    par fan-out paralelo
+        P->>H: regex/sigs (SQLi, XSS, LFI...)
+        P->>A: payload suspeito? embeddings
+        P->>R: path existe? método permitido?
+    end
+    H-->>S: signals + pesos
+    A-->>S: score anomalia
+    R-->>S: -delta se rota inválida
+    S->>S: combinar → risk_score + level
+    S->>D: AnalysisResult
+    D->>D: aplicar política (ex: High+IP novo = Challenge)
+    alt Decision == Block
+        D->>CF: firewall_rules: block IP
+        D->>DB: registrar incidente
+    else Decision == Challenge
+        D->>CF: challenge IP (JS/Turnstile)
+    else Allow
+        D->>DB: métricas only
+    end
+    D-->>N: (não interfere no nginx na fase 1; modo inline no futuro)
+`} />
+
+## Detecção de rotas válidas
+
+1. **Discovery controlado**: o usuário fornece rotas válidas via config
+   (allowlist) **ou** o Sentry aprende em modo `learn` (período de baseline
+   sem ataques).
+2. Estrutura: trie de paths com métodos permitidos + parâmetros esperados.
+3. Sinais derivados:
+   - Rota inexistente → +pontos (scan/directory brute-force).
+   - Muitos 404 do mesmo IP em janela → scan behavior.
+   - Hits em paths sensíveis (`/.env`, `/wp-admin`, `/api/admin`) mesmo
+     inexistentes → peso alto.
+4. Saída: relatório `sentry routes` mostrando rotas conhecidas vs. tentadas.
+
+## Integração Cloudflare (sinergia de challenge)
+
+<Mermaid chart={`
+flowchart LR
+    EVT[Evento High/Critical] --> CF1{Cloudflare habilitado?}
+    CF1 -->|sim| CF2[Resolver zona+IP]
+    CF2 --> CF3{Já bloqueado recentemente?}
+    CF3 -->|não| CF4[Criar/Atualizar firewall rule]
+    CF3 -->|sim| CF5[Estender TTL]
+    CF4 --> CF6[Challenge mode: js_challenge|managed_challenge|block]
+    CF6 --> CF7[Webhook confirmação]
+    CF1 -->|não| BL[Blocklist local only]
+`} />
+
+- Tokens via env (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
+- Cache local de IPs já desafiados (TTL configurável) para não bombardear a API.
+- Modos: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
+- **Importante**: na fase 1 o Sentry é **read-only + Cloudflare action**. Não
+  há inline proxy. Inline é fase futura (`sentry-proxy`).

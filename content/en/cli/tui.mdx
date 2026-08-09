@@ -1,0 +1,66 @@
+---
+title: "Interactive TUI"
+description: "Fullscreen terminal UI with ratatui"
+---
+
+# Interactive TUI
+
+The CLI has **two `tail` modes**:
+
+- `sentry tail` (or `sentry tail --tui`) → opens an **interactive fullscreen
+  TUI** with `ratatui` + `crossterm`. Default mode when the terminal is a TTY.
+- `sentry tail --stream` → **non-interactive** mode, one line per event
+  (JSON or colored text). Ideal for piping (`| jq`, `| grep`), structured
+  logs or redirection. Automatically enabled when stdin/stdout is not a TTY
+  (detection via `std::io::IsTerminal`).
+
+## Fullscreen layout — 3 zones
+
+```
+┌──────────────────────── Sentry — live ────────────────────────┐
+│ req/s 412 ▁▂▃▅▇▆▄▂   Info 9.8k  Low 142  Med 31  High 7  Crit 1│  ← header/sparkline
+├────────────────────────────────────────────────────────────────┤
+│ CRIT 1.2.3.4   POST /api/login   SQLi:' OR 1=1--               │  ← colored stream
+│ HIGH 5.6.7.8   GET  /.env         UnknownRoute+sensitive        │     (scroll, filter)
+│ MED  9.0.1.2   GET  /wp-admin     ScanBehavior (12x404/60s)     │
+│ ...                                                            │
+├────────────────────────────────────────────────────────────────┤
+│ Top IPs suspeitos        │ Top paths atacados   │ ASN/Geo      │  ← aggregated footer
+│ 1.2.3.4    18  CRIT      │ /admin     22        │ AS1234  41%  │
+│ 5.6.7.8    11  HIGH      │ /.env      9         │ Tor     3%   │
+└────────────────────────────────────────────────────────────────┘
+ [f]iltrar [b]loquear [c]hallenge [i]nfo IP [r]otas [q]sair
+```
+
+## Shortcuts
+
+| Key     | Action                                                  |
+|---------|---------------------------------------------------------|
+| `j`/`↓` | Navigate down                                           |
+| `k`/`↑` | Navigate up                                             |
+| `g`     | Go to top                                               |
+| `G`     | Go to bottom                                            |
+| `Space` | Pause/freeze the stream (buffered)                       |
+| `Enter` | Open event detail (headers, payload, signals, AI verdict) |
+| `b`     | Block selected IP (asks for confirmation)               |
+| `c`     | Trigger Cloudflare challenge                            |
+| `i`     | Show full IP history                                    |
+| `f`     | Open filter (by level/IP/path/ASN)                      |
+| `r`     | Open routes panel                                       |
+| `/`     | Text search                                             |
+| `q`/`Esc`| Quit                                                    |
+
+## Responsive rendering
+
+- Terminal resizing supported.
+- Footer columns switch based on width.
+
+## Themes
+
+`--theme dark|light|mono` (accessibility / colorless terminals).
+
+## Implementation
+
+Standalone TUI in `sentry-cli/src/tui.rs` (~250 lines), reads recent events
+from Postgres, scrollable, with shortcuts `j`/`k`/`Space`/`g`/`G`/`q`/
+`Esc`.

@@ -1,0 +1,58 @@
+---
+title: "Detection Layers"
+description: "Heuristics → ONNX → LLM"
+---
+
+# Detection Layers
+
+Sentry combines three detection layers in a cascade: deterministic heuristics
+(fast, zero known false positives), a local ONNX model (for the unknown), and
+an optional on-demand LLM (for complex payloads without a clear verdict).
+
+<Mermaid chart={`
+flowchart TB
+    E[Evento] --> L0{Heurística rápida}
+    L0 -->|benigno claro| OK[Allow rápido]
+    L0 -->|malicioso claro| BLK[Block rápido]
+    L0 -->|incerto| L1[Embeddings + modelo ONNX]
+    L1 --> L2{Confiança > threshold?}
+    L2 -->|sim| DEC[Usar verdict IA]
+    L2 -->|não| L3[LLM opcional - prompt enxuto]
+    L3 --> DEC
+`} />
+
+## Layer 0 — Heuristics
+
+Always runs, ~µs. Regex for SQLi/XSS/path traversal, ASN allowlist, local IP
+reputation. 9 detectors in `sentry-core/src/heuristics.rs`:
+
+- SQLi
+- XSS
+- PathTraversal
+- LFI
+- Log4Shell
+- CmdInjection
+- SensitivePath
+- BadCrawler
+- EmptyUserAgent
+
+Heuristics run on the **URL-decoded** form of the path/query
+(`heuristics::http_text`), so that encoded payloads (`%27` = `'`, `+` or
+`%20` = space) cannot bypass them.
+
+## Layer 1 — Local ONNX model
+
+Classifier trained on malicious payloads (SQLi, XSS, RCE, log4shell). Offline
+training, versioned model in `models/`. Local inference without depending on
+an external API.
+
+## Layer 2 — On-demand LLM (optional, high cost)
+
+Only for Medium events without a clear verdict; short prompt with truncated
+path+headers+payload. Structured response via JSON schema. Provider-agnostic
+via the `LlmProvider` trait.
+
+## Retraining
+
+Offline pipeline consumes confirmed incidents → new model →
+`sentry model reload`.

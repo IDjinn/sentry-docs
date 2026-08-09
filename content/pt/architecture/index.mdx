@@ -1,0 +1,109 @@
+---
+title: "Arquitetura de Alto Nível"
+description: "Pipeline do Sentry, camadas e princípios de design"
+---
+
+# Arquitetura de Alto Nível
+
+O Sentry é organizado em três camadas de plugins (Sources, Core, Actions)
+sobre uma camada de persistência. Todo plugin implementa um trait comum,
+permitindo adicionar fontes e ações sem recompilar o core.
+
+<Mermaid chart={`
+flowchart TB
+    subgraph Sources[Camada de Fontes — Plugins]
+        N1[Nginx Access Log]
+        N2[HTTP Proxy Middleware]
+        N3[TCP Capture]
+        N4[Syslog / Journald]
+        N5[Cloudflare Logs]
+    end
+
+    subgraph Core[Core Sentry]
+        ING[Ingestor<br/>Normaliza p/ Event]
+        PIPE[Pipeline de Análise]
+        AI[Motor de IA]
+        HEUR[Heurísticas/Regras]
+        ROUTE[Validador de Rotas]
+        RISK[Score de Risco]
+        DECID[Decisor / Política]
+    end
+
+    subgraph Actions[Camada de Ações — Plugins]
+        A1[Block IP]
+        A2[Rate Limit]
+        A3[Cloudflare Challenge]
+        A4[Alerta Webhook]
+        A5[Log/Store]
+    end
+
+    subgraph Storage[Persistência]
+        DB[(SQLite / Postgres)]
+        BL[(Blocklist state)]
+    end
+
+    Sources --> ING
+    ING --> PIPE
+    PIPE --> HEUR
+    PIPE --> AI
+    PIPE --> ROUTE
+    HEUR --> RISK
+    AI --> RISK
+    ROUTE --> RISK
+    RISK --> DECID
+    DECID --> Actions
+    Actions --> Storage
+    DECID --> Storage
+`} />
+
+## Princípios de design
+
+1. **Trait `Source`**: todo plugin implementa `fn stream_events(&self) -> impl Stream<Item = RawEvent>`. Adicionar nginx = implementar o trait.
+2. **Trait `Action`**: `fn execute(&self, decision: &Decision) -> Result<()>`. Block, Challenge, Alert etc.
+3. **Event normalizado**: um único `struct Event` independente da origem. O core nunca sabe se veio do nginx ou do TCP.
+4. **Pipeline assíncrono**: `tokio` + canais. Cada estágio é um actor/fan-out.
+5. **Configuração declarativa**: `sentry.toml` define fontes ativas, ações ativas, thresholds.
+
+## Stack técnica
+
+| Camada            | Crate / Tecnologia                                  | Justificativa                                          |
+|-------------------|-----------------------------------------------------|--------------------------------------------------------|
+| Async runtime     | `tokio`                                             | Padrão de facto, multi-plataforma                      |
+| CLI               | `clap` (derive) + `ratatui` para TUI live          | Ergonomia, subcomandos, painel ao vivo                 |
+| Config            | `serde` + `toml` + `figment` (env+file merge)      | Override por env var em prod                           |
+| Logs/Tracing      | `tracing` + `tracing-subscriber`                   | Structured logging, spans por requisição               |
+| Parser nginx      | `nom` ou `regex` + `serde`                         | Linhas de log access_log custom format                 |
+| HTTP client       | `reqwest` (rustls)                                 | Cloudflare API, webhooks, geolookup                    |
+| ML/IA local       | `ort` (ONNX Runtime) + `candle` fallback           | Inferência local sem depender de API externa           |
+| LLM (opcional)    | trait `LlmProvider` + adapters: **OpenRouter** (rota p/ qualquer modelo), `async-openai`, `ollama-rs` | Análise de payload complexa sob demanda, provider-agnostic |
+| Storage           | `sqlx` com **Postgres** default (migrations sqlx), SQLite opcional via feature | Mesmo schema, troca por feature flag; Postgres suporta HA e múltiplos nós desde cedo |
+| Geolookup         | `maxminddb` (DB local)                             | Sem chamada externa por evento                         |
+| IPC/Embeddable    | `core` como lib crate (`sentry-core`)              | Futuro dashboard consome a mesma lib                    |
+| Serialização      | `serde` + `serde_json`                             | Eventos, export, API futura                            |
+| Erros             | `thiserror` (lib) + `color-eyre` (bin)             | Ergonomia + backtraces legíveis                        |
+| Testes            | `proptest` + `insta` (snapshots) + `wiremock`      | Payloads maliciosos, fixtures de log                   |
+| Build/Release     | `cargo-dist` ou `cross`                            | Binários multi-OS                                      |
+
+## Estrutura de crates (workspace)
+
+```
+sentry/
+├── Cargo.toml                    # workspace
+├── crates/
+│   ├── sentry-core/              # lib: Event, traits, pipeline, scoring
+│   ├── sentry-source-nginx/      # plugin Source: nginx log tail
+│   ├── sentry-source-http/       # plugin Source: middleware proxy (futuro)
+│   ├── sentry-source-tcp/        # plugin Source: pcap (futuro)
+│   ├── sentry-source-cloudflare/ # plugin Source: pull logs CF
+│   ├── sentry-ai/                # ONNX + LLM provider trait
+│   ├── sentry-action-cloudflare/ # plugin Action
+│   ├── sentry-action-webhook/    # plugin Action
+│   ├── sentry-action-blocklist/  # plugin Action
+│   ├── sentry-storage/           # sqlx SQLite/Postgres
+│   ├── sentry-geo/               # maxminddb wrapper
+│   └── sentry-cli/               # binário: clap + ratatui + entrypoint
+├── models/                       # modelos ONNX versionados
+├── config/sentry.example.toml
+├── tests/                        # integration tests
+└── docs/
+```

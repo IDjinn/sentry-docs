@@ -1,0 +1,41 @@
+---
+title: "Risk Levels and Verdicts"
+description: "Score, levels and default verdicts"
+---
+
+# Risk Levels and Verdicts
+
+The scorer combines signals from heuristics, AI and the route validator into a
+`risk_score` (0–100) and a `risk_level`. The decider then maps the level to a
+default verdict, applicable per policy.
+
+| Score  | Level    | Color    | Default verdict                   |
+|--------|----------|----------|-----------------------------------|
+| 0–9    | Info     | gray     | Allow                             |
+| 10–29  | Low      | blue     | Allow + observation               |
+| 30–49  | Medium   | yellow   | Increasing rate-limit             |
+| 50–74  | High     | orange   | Challenge (Cloudflare)            |
+| 75–100 | Critical | red      | Block IP + alert                  |
+
+Policy is configurable per route/IP-range/ASN. E.g. `/admin/*` has a lower
+threshold.
+
+## Initial signal weights
+
+| Signal                              | Weight | Accumulates? |
+|-------------------------------------|--------|--------------|
+| SQLi (regex)                        | 60     | no           |
+| XSS (regex)                         | 45     | no           |
+| Path traversal (`../`, `%2e`)       | 40     | yes          |
+| Log4Shell (`${jndi:`)               | 80     | no           |
+| RCE/cmd injection                   | 70     | no           |
+| Non-existent route                  | 8      | yes          |
+| >10 404/IP in 60s                   | 35     | —            |
+| Empty/suspicious user-agent         | 10     | yes          |
+| Tor exit node                       | 15     | —            |
+| IP in reputation feed               | 50     | —            |
+| ONNX anomaly > 0.8                  | 50     | no           |
+| Access to sensitive path           | 30     | yes          |
+
+Weights combine (sum capped at 100), with a bonus for repetition within a
+window. **Everything is configurable.**

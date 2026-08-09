@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@import "fumadocs-ui/style.css";
+
+@theme {
+  --font-sans: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-mono), ui-monospace, monospace;
+}
+
+:root {
+  --fd-background: oklch(0.985 0 0);
+  --fd-foreground: oklch(0.18 0.01 280);
+}
+
+html {
+  scroll-behavior: smooth;
+}

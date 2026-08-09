@@ -1,0 +1,65 @@
+---
+title: "Deploy on Kubernetes"
+description: "Kubernetes manifests and kubectl"
+---
+
+# Deploy on Kubernetes
+
+Sentry is distributed with Kubernetes manifests in `deploy/k8s/` for cluster
+deployment. The manifests include Deployment, Service, ConfigMap and Secrets
+(secrets via env, not in the ConfigMap).
+
+## Apply the manifests
+
+```bash
+kubectl apply -f deploy/k8s/
+```
+
+## Verify the deploy
+
+```bash
+kubectl get pods -l app=sentry
+kubectl logs -f deployment/sentry
+kubectl describe pod -l app=sentry
+```
+
+## Secrets
+
+Secrets (Cloudflare tokens, LLM key, Postgres URL) must go in Secrets, not
+ConfigMaps:
+
+```bash
+kubectl create secret generic sentry-secrets \
+    --from-literal=cf-token=$SENTRY_CF_TOKEN \
+    --from-literal=cf-zone=$SENTRY_CF_ZONE \
+    --from-literal=llm-key=$SENTRY_LLM_KEY \
+    --from-literal=pg-url=$SENTRY_STORAGE__POSTGRES__URL
+```
+
+The manifests reference the secrets via `envFrom: secretRef:` or
+`valueFrom: secretKeyRef:`.
+
+## Postgres
+
+For production, use a managed Postgres (e.g. Cloud SQL, RDS, or a StatefulSet
+with PVC). The example manifests assume an external Postgres configurable via
+`SENTRY_STORAGE__POSTGRES__URL`.
+
+## Horizontal scaling
+
+Because state (rules, ip_state) is shared in Postgres, multiple Sentry
+replicas can run in parallel. Hot-reload of rules via `LISTEN/NOTIFY` works
+across pods (all listen on the same `sentry_rules_changed` channel).
+
+```bash
+kubectl scale deployment/sentry --replicas=3
+```
+
+## Update the configuration
+
+Edit the ConfigMap and restart the deployment:
+
+```bash
+kubectl edit configmap sentry-config
+kubectl rollout restart deployment/sentry
+```

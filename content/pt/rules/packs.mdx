@@ -1,0 +1,169 @@
+---
+title: "Default Rule Packs"
+description: "Packs pré-configurados que acompanham o Sentry"
+---
+
+# Default Rule Packs
+
+Packs shipados com o Sentry, ativáveis com uma linha. Cada pack é um conjunto
+de regras com `tags` para fácil inspeção/edição via CLI.
+
+| Pack                | Default       | O que faz                                                                  |
+|---------------------|---------------|----------------------------------------------------------------------------|
+| `vpn_proxy`         | on            | Block/Challenge IPs classificados como VPN/proxy (reputation = Vpn/Proxy)  |
+| `tor`               | on            | Block exit nodes Tor (reputation = Tor)                                     |
+| `datacenter_abuse`  | on            | Challenge ASNs de datacenter fora de allowlist (DigitalOcean, OVH, Hetzner, etc. — alvos de bots) |
+| `crawlers_bad`      | on            | Block UAs de scanners/ferramentas de ataque: `sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, `curl/8.*` suspeito, `python-requests` sem contexto |
+| `crawlers_good`     | off           | **Allow** bots legítimos (Googlebot, Bingbot, etc.) — verificação via reverse-DNS conforme spec do Google |
+| `empty_ua`          | on            | Challenge/block requisições sem User-Agent (raro em tráfego legítimo)       |
+| `sensitive_paths`   | on (enforce)  | **Block** hits em arquivos/dirs sensíveis por default (ver lista completa abaixo) |
+| `country_blocklist` | off           | Block países não atendidos (configura lista ISO)                           |
+| `country_allowlist` | off           | Allow só países da lista (mais restritivo, modo opt-in)                    |
+| `http_anomaly`      | on            | Block métodos raros não usados (`TRACE`, `CONNECT`), HTTP/0.9, headers malformados |
+| `rate_scan`        | on            | Rate-limit/Block IP com >N 404 em janela (directory brute-force)            |
+
+**Semântica de default `on`**: packs vêm ativos mas em modo `Log` ou
+`Challenge` (não `Block` direto) no primeiro deploy — modo *shadow* para
+validar antes de endurecer. Usuário promove para `Block` após confirmar zero
+falso-positivo. Controlado por `mode = "shadow" | "enforce"` por pack.
+**Exceção**: `sensitive_paths` já vem em `enforce` por default (acesso a
+`.env`/`.git` é sempre malicioso).
+
+## Pack `sensitive_paths` — lista completa (default enforce)
+
+Arquivos e diretórios cujo acesso é **sempre bloqueado** por default.
+Cobertura dividida em categorias; cada entrada é uma regra `path regex` →
+`Block`. A lista é extensível via config/DB.
+
+### Credenciais & configuração
+
+```
+\.env(\.local|\.production|\.development)?$      # .env, .env.local, ...
+\.env\.[a-z]+$                                    # qualquer variante .env.*
+config\.(php|json|yml|yaml|ini|conf)              # configs de app
+secrets\.(json|yml|yaml)
+credentials\.(json|csv)
+\.htpasswd
+wp-config\.php
+local\.xml                                        # Magento
+settings\.php                                     # Drupal
+configuration\.php                                # Joomla
+```
+
+### SCM & metadata de diretório
+
+```
+/\.git/                                           # .git/, HEAD, config, index
+/\.svn/
+/\.hg/
+/\.bzr/
+/\.gitignore
+/\.gitattributes
+/\.dockerignore
+```
+
+### Cloud & infraestrutura
+
+```
+/\.aws/                                           # credentials, config
+/\.ssh/                                           # id_rsa, id_ed25519, authorized_keys
+/\.gcp/
+/\.azure/
+/\.kube/                                          # kubeconfig
+/\.docker/                                        # config.json com tokens de registry
+/\.terraform(\.tfstate)?
+```
+
+### Arquivos de build & artefatos
+
+```
+/(package-lock\.json|yarn\.lock|composer\.lock)   # opcional: info de versão p/ recon
+/(docker-compose\.yml|docker-compose\.yaml)       # expõe topologia de serviços
+/(Dockerfile|Puppetfile|Vagrantfile)
+/\.npmrc                                          # tokens npm
+/\.pypirc                                         # tokens pypi
+/\.netrc                                          # creds HTTP
+```
+
+### Painéis admin & ferramentas conhecidas
+
+```
+/(wp-admin|wp-login\.php)                         # WordPress
+/(phpmyadmin|pma|phpMyAdmin)                      # phpMyAdmin
+/(adminer|adminer\.php)
+/(wp-content/uploads/phpmailer)                   # exploit comum
+/manager/                                         # Tomcat manager
+/server-status                                    # Apache mod_status
+/server-info
+/nginx-status
+/fpm-status
+/actuator(/env|/heapdump|/threaddump)?            # Spring Boot actuator sensível
+/health(/.*)?                                     # opcional (pode ser legit)
+```
+
+### Backup & dump
+
+```
+\.(sql|bak|backup|old|swp|tmp|orig|save|copy)$
+/(dump|backup|db)\.(sql|tar|gz|zip|tgz)
+/www\.(zip|tar|gz|rar|7z)                         # full-site dumps
+```
+
+### Sistema & expostos perigosos
+
+```
+/\.well-known/security\.txt$        # ALLOW (legítimo — RFC 9116) → allowlist explícita
+/\.DS_Store
+/Thumbs\.db
+/(etc/passwd|etc/shadow)             # path traversal via decode
+/(proc/self/environ|proc/self/fd/.*)
+```
+
+## Implementação técnica
+
+- Cada categoria é um *sub-pack* toggleável individualmente (`sentry rules
+  packs list` mostra estado granular).
+- A allowlist interna **sempre** permite `/.well-known/security.txt`
+  (RFC 9116 — documento público de divulgação responsável) mesmo com o pack
+  ativo.
+- Match case-insensitive (`.ENV` == `.env`) para evitar bypass trivial.
+- Considera encodings: `%2e` (`.`), `%2f` (`/`), `..;/` (path traversal
+  smuggling), double-encoding — normalização pré-match.
+- Rotas explicitamente allowlistadas pelo usuário
+  (`[[rules.custom]] action = "allow"`) têm prioridade sobre o pack,
+  permitindo expor `/admin/` se a app realmente precisar.
+
+## Por que `enforce` e não `shadow` desde o início
+
+Acessos a `.git/`, `.env`, `.ssh/` são estatisticamente 100% maliciosos em
+apps web (não há motivo legítimo para um browser acessar isso). O custo de
+um falso-positivo aqui é nulo vs. o risco de vazar credenciais.
+
+## Config no `sentry.toml`
+
+```toml
+[[rules.pack]]
+name = "sensitive_paths"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "vpn_proxy"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "tor"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "crawlers_bad"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "crawlers_good"
+mode  = "enforce"         # allow Googlebot etc.
+
+[[rules.pack]]
+name = "country_blocklist"
+mode  = "enforce"
+countries = ["RU","CN","KP"]   # ISO codes
+```

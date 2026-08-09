@@ -1,0 +1,64 @@
+---
+title: "Challenge Providers"
+description: "Edge actions provider-agnostic via ChallengeProvider"
+---
+
+# Edge Actions and ChallengeProvider
+
+Edge actions (block / challenge / rate-limit at CDN/WAF) are
+**provider-agnostic** via the `ChallengeProvider` trait, mirroring the
+`LlmProvider` pattern. This lets you switch from Cloudflare to AWS WAF,
+Fastly, Bunny… without changing `ActionKind`, the rules, or the verdict
+filter.
+
+## How it works
+
+The `ChallengeAction` type (in `sentry-core`) does the **verdict filter**
+(`Block`/`Challenge`/`RateLimit`) and **delegates** to the provider. The
+provider only implements `apply(ip, verdict, opts)`. The "which verdict
+becomes an action" logic lives in core; the provider just executes at the
+edge.
+
+## Canonical config
+
+```toml
+[[action]]
+type = "challenge"
+provider = "cloudflare"        # extensible: aws_waf, fastly, ...
+[action.options]
+mode = "managed_challenge"     # block | js_challenge | managed_challenge | rate_limit
+ttl_secs = 86400
+```
+
+The legacy alias `type = "cloudflare"` (without `provider`) is kept for
+compatibility and is equivalent.
+
+## Adding a new edge provider (AWS WAF, Fastly, Bunny…)
+
+1. Create the crate `sentry-action-<name>` implementing `ChallengeProvider`.
+2. Add it to `sentry-cli/Cargo.toml`.
+3. Add an arm to the `daemon::build_challenge_action` match.
+
+Without changing `ActionKind`, rules, or the verdict filter.
+
+## Cloudflare (default provider)
+
+- Tokens via env (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
+- Local cache of already-challenged IPs (configurable TTL) to avoid hammering the API.
+- Modes: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
+- **Important**: in phase 1 Sentry is **read-only + Cloudflare action**.
+  There is no inline proxy. Inline is a future phase (`sentry-proxy`).
+
+## Cloudflare integration (synergy)
+
+<Mermaid chart={`
+flowchart LR
+    EVT[Evento High/Critical] --> CF1{Cloudflare habilitado?}
+    CF1 -->|sim| CF2[Resolver zona+IP]
+    CF2 --> CF3{Já bloqueado recentemente?}
+    CF3 -->|não| CF4[Criar/Atualizar firewall rule]
+    CF3 -->|sim| CF5[Estender TTL]
+    CF4 --> CF6[Challenge mode: js_challenge|managed_challenge|block]
+    CF6 --> CF7[Webhook confirmação]
+    CF1 -->|não| BL[Blocklist local only]
+`} />

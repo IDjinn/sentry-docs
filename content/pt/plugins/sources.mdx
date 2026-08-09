@@ -1,0 +1,45 @@
+---
+title: "Trait de Source"
+description: "Plugins de origem de dados"
+---
+
+# Trait de Source
+
+Toda origem de dados é um plugin por trás do trait `Source`. O core nunca
+sabe se o evento veio do nginx, do TCP ou de logs da Cloudflare — apenas
+consome um stream de `RawEvent` normalizado para `Event`.
+
+```rust
+// sentry-core/src/source.rs
+#[async_trait]
+pub trait Source: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn stream(&self) -> anyhow::Result<mpsc::Receiver<RawEvent>>;
+}
+```
+
+## Implementações
+
+| Crate                          | Origem                  | Status  |
+|--------------------------------|-------------------------|---------|
+| `sentry-source-nginx`          | Tail do access.log     | Pronto  |
+| `sentry-source-http`           | Middleware axum/actix (cópia da req) | Futuro  |
+| `sentry-source-tcp`            | Captura via `pnet`/`pcap` (libpcap)  | Futuro  |
+| `sentry-source-cloudflare`     | Pull de logs via API em polling      | Futuro  |
+| `sentry-source-syslog`         | Receptor RFC 5424 (UDP/TCP)          | Futuro  |
+
+## Registro dinâmico
+
+Cada plugin expõe `pub fn register(reg: &mut Registry)`. O binário habilita
+plugins via feature flags Cargo + entry em `sentry.toml`. **Sem recompilar
+para ativar/desativar** — só config.
+
+## Convenções
+
+- Toda crate de plugin (`sentry-source-*`) depende apenas de `sentry-core`,
+  nunca de outras plugins.
+- `sentry-core` é **pure** (sem I/O pesado, sem HTTP, sem DB). Define
+  contratos.
+- Deps compartilhadas ficam em `[workspace.dependencies]` no raiz; cada
+  crate referencia via `{ workspace = true }`.
+- Features pesadas (ONNX) ficam **opcionais** e desligadas por default.

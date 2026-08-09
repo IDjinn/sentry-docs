@@ -1,0 +1,50 @@
+---
+title: "Overview"
+description: "What Sentry is, goals and non-goals"
+---
+
+# Overview
+
+**Sentry** is a real-time access monitor for services exposed to the internet. It starts by monitoring **nginx** (via access logs) but is designed to scale to **any port/protocol** (HTTP, TCP, reverse proxies, packet capture, syslog). It uses AI + heuristics to detect malicious payloads, suspicious behavior, and invalid routes, and computes a **risk level** per request/IP. It integrates with **Cloudflare** for edge-layer challenge/block.
+
+## Goals
+
+- **Total modularity**: each data source (nginx, tcp, http-proxy) is a plugin behind a common trait.
+- **Real time**: event streaming, not batch.
+- **Precision**: combine deterministic rules (fast, zero known false positives) with AI (for the unknown).
+- **Action**: not only detect — block, challenge, rate-limit.
+- **Cross-platform**: a single Rust binary.
+- **Operable**: rich CLI for live tail, reports, export, blocklist management.
+
+## Non-goals (current phase)
+
+- Web dashboard (future phase, via Tauri or a separate HTTP backend).
+- Replace a commercial WAF — it's complementary.
+- Deep packet inspection of non-HTTP protocols in phase 1.
+
+## Why it exists
+
+Commercial WAFs cover the obvious. Sentry covers the **rest**: encoded payloads, sensitive path scanning, malicious crawlers, anomalous access patterns — combining fast rules (zero known false positives) with AI for the unknown. All in a single Rust binary, running locally, without sending your logs to third parties.
+
+## Tech stack
+
+| Layer             | Technology                                          |
+|-------------------|-----------------------------------------------------|
+| Async runtime     | `tokio`                                             |
+| CLI               | `clap` (derive) + `ratatui` (TUI) + crossterm       |
+| Storage           | Postgres (`sqlx`, sqlx migrations)                  |
+| Config            | `figment` (TOML + env overlay, `SENTRY_` prefix)   |
+| HTTP client       | `reqwest` (native-tls on Windows / rustls in containers) |
+| AI                | `ort` (ONNX, local) + `LlmProvider` trait           |
+| Edge actions      | `ChallengeProvider` trait (Cloudflare, …)           |
+| Geo/ASN           | `maxminddb` (local GeoLite2)                        |
+| Errors            | `thiserror` (lib) + `color-eyre` (bin)              |
+| Tests             | `proptest` + `insta` (snapshots) + `wiremock`       |
+
+## Status
+
+- **F0** (done): foundation — workspace, core, traits, config, CLI skeleton.
+- **F1** (done): nginx MVP — source, heuristics, scorer, pipeline, TUI.
+- **F2**: Cloudflare + local AI (ONNX).
+- **F3**: Multi-source (TCP, syslog) + LLM (OpenRouter).
+- **F4**: Web dashboard.

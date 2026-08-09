@@ -1,0 +1,133 @@
+---
+title: "Sentry Auto"
+description: "Detecção de framework e geração automática de regras"
+---
+
+# Sentry Auto
+
+Subprojeto que torna o Sentry **zero-config** para apps comuns: ao rodar
+`sentry auto` na raiz de um site/projeto, o Sentry **detecta o
+framework/stack** e **gera regras, rotas conhecidas e packs recomendados**
+sob medida. Em vez de partir de uma config genérica, o Sentry entende o que
+está rodando e protege o que importa.
+
+## Fluxo
+
+<Mermaid chart={`
+flowchart TB
+    ROOT[Raiz do projeto] --> SCAN{Scanner de arquivos}
+    SCAN -->|composer.json| WP[WordPress? Laravel?]
+    SCAN -->|package.json| NODE[Next.js? Express?]
+    SCAN -->|requirements.txt| PY[Django? Flask?]
+    SCAN -->|Gemfile| RB[Rails?]
+    SCAN -->|*.csproj| DOTNET[ASP.NET?]
+    SCAN -->|Dockerfile| DOCK[Docker stack detect]
+    SCAN -->|nginx.conf| NGINX[Nginx config parse]
+    SCAN -->|web.config| IIS[IIS/ASP.NET]
+    WP --> DETECT[FrameworkProfile]
+    NODE --> DETECT
+    PY --> DETECT
+    RB --> DETECT
+    DOTNET --> DETECT
+    DOCK --> DETECT
+    NGINX --> DETECT
+    IIS --> DETECT
+    DETECT --> GEN[Gerar regras + rotas + packs]
+    GEN --> OUT[sentry.auto.toml]
+    OUT --> MERGE[Merge com sentry.toml do usuário]
+    MERGE --> RUN[sentry run]
+`} />
+
+## Detecção (scanner)
+
+O scanner lê a raiz do projeto e identifica o(s) framework(s) por:
+
+1. **Arquivos-âncora**: `wp-config.php` → WordPress, `artisan` → Laravel,
+   `manage.py` → Django.
+2. **Manifestos**: `composer.json` (PHP), `package.json` (Node),
+   `requirements.txt`/`pyproject.toml` (Python), `Gemfile` (Ruby),
+   `*.csproj` (.NET).
+3. **AST parsing** (opcional, profundo): parse de `routes.rb` (Rails),
+   `urls.py` (Django), `app.js` (Express) para extrair rotas **exatas** —
+   não só padrões.
+4. **Config de servidor**: `nginx.conf` parse → `location` blocks viram
+   rotas conhecidas.
+5. **Múltiplos frameworks**: se detectar mais de um (ex: nginx + WordPress),
+   combina perfis.
+
+## Trait `FrameworkDetector`
+
+```rust
+// sentry-auto/src/detect.rs
+pub trait FrameworkDetector: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn detect(&self, root: &Path) -> Option<FrameworkProfile>;
+}
+
+pub struct FrameworkProfile {
+    pub framework: String,
+    pub version: Option<String>,
+    pub routes: Vec<RouteDef>,       // rotas exatas detectadas
+    pub sensitive_paths: Vec<String>, // específicas do framework
+    pub admin_paths: Vec<String>,
+    pub recommended_packs: Vec<String>,
+    pub recommended_rules: Vec<RuleDef>,
+}
+```
+
+## Geração de regras
+
+A partir do `FrameworkProfile`, o gerador produz:
+
+1. **Rotas conhecidas** (`[[routes.known]]`): para o validador de rotas —
+   404 em rota não-listada vira sinal `UnknownRoute`.
+2. **Regras específicas**:
+   - WordPress: `wp-login.php` rate-limit (5 tentativas/min), `xmlrpc.php`
+     block por default.
+   - Laravel: `storage/logs` block, `.env` block (já no pack
+     `sensitive_paths` mas reforçado).
+   - Django: `admin/login/` rate-limit.
+3. **Allowlists inteligentes**: assets estáticos (`/static/`,
+   `/_next/static/`, `/wp-content/uploads/`) não devem disparar rate-limit
+   mesmo em alto volume.
+4. **Packs recomendados**: ativa `sensitive_paths` em enforce,
+   `crawlers_bad` em enforce, `rate_scan` em enforce para paths admin.
+
+## Arquitetura do subprojeto
+
+```
+crates/
+├── sentry-auto/                # crate do `auto` command
+│   ├── src/
+│   │   ├── lib.rs               # FrameworkDetector trait, FrameworkProfile
+│   │   ├── detect.rs            # scanner de arquivos
+│   │   ├── generate.rs          # profile → rules/routes config
+│   │   └── profiles/
+│   │       ├── wordpress.rs
+│   │       ├── laravel.rs
+│   │       ├── nextjs.rs
+│   │       ├── django.rs
+│   │       ├── rails.rs
+│   │       ├── express.rs
+│   │       ├── aspnet.rs
+│   │       └── nginx.rs         # parse de nginx.conf
+│   └── tests/                   # fixtures de projetos reais por framework
+└── sentry-cli/                 # adiciona `sentry auto` subcommand
+```
+
+## Detecção de rotas via AST (modo `--deep`)
+
+Para frameworks onde as rotas estão no código (Rails, Django, Express,
+Flask), o `--deep` faz **AST parsing** com `tree-sitter`:
+
+| Framework  | Arquivo              | Parser                          |
+|------------|----------------------|---------------------------------|
+| Rails      | `config/routes.rb`   | `tree-sitter-ruby`              |
+| Django    | `urls.py`            | `tree-sitter-python`            |
+| Express   | `routes/*.js`        | `tree-sitter-javascript`        |
+| Flask     | `app.py`             | `tree-sitter-python`            |
+| Laravel   | `routes/web.php`     | `tree-sitter-php`               |
+
+`tree-sitter` é a escolha: parsers incrementais rápidos, multi-linguagem,
+uma única crate `tree-sitter` com bindings. Extrair `@app.route("/foo")` ou
+`get "/bar"` → `RouteDef { path: "/foo", methods: ["GET"] }`.

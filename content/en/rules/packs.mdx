@@ -1,0 +1,169 @@
+---
+title: "Default Rule Packs"
+description: "Pre-configured packs shipped with Sentry"
+---
+
+# Default Rule Packs
+
+Packs shipped with Sentry, enabled with a single line. Each pack is a set of
+rules with `tags` for easy inspection/editing via CLI.
+
+| Pack                | Default       | What it does                                                                |
+|---------------------|---------------|-----------------------------------------------------------------------------|
+| `vpn_proxy`         | on            | Block/Challenge IPs classified as VPN/proxy (reputation = Vpn/Proxy)        |
+| `tor`               | on            | Block Tor exit nodes (reputation = Tor)                                     |
+| `datacenter_abuse`  | on            | Challenge datacenter ASNs not in allowlist (DigitalOcean, OVH, Hetzner, etc. — bot targets) |
+| `crawlers_bad`      | on            | Block UAs of scanners/attack tools: `sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, suspicious `curl/8.*`, `python-requests` with no context |
+| `crawlers_good`     | off           | **Allow** legitimate bots (Googlebot, Bingbot, etc.) — verified via reverse-DNS per Google's spec |
+| `empty_ua`          | on            | Challenge/block requests with no User-Agent (rare in legitimate traffic)     |
+| `sensitive_paths`   | on (enforce)  | **Block** hits on sensitive files/dirs by default (see full list below)     |
+| `country_blocklist` | off           | Block unsupported countries (configure ISO list)                           |
+| `country_allowlist` | off           | Allow only listed countries (more restrictive, opt-in mode)                |
+| `http_anomaly`      | on            | Block rare unused methods (`TRACE`, `CONNECT`), HTTP/0.9, malformed headers |
+| `rate_scan`        | on            | Rate-limit/Block IP with >N 404s in a window (directory brute-force)         |
+
+**Default `on` semantics**: packs ship active but in `Log` or `Challenge` mode
+(not direct `Block`) on first deploy — *shadow* mode to validate before
+hardening. The user promotes to `Block` after confirming zero false positives.
+Controlled by `mode = "shadow" | "enforce"` per pack.
+**Exception**: `sensitive_paths` ships in `enforce` by default (access to
+`.env`/`.git` is always malicious).
+
+## `sensitive_paths` pack — full list (default enforce)
+
+Files and directories whose access is **always blocked** by default. Coverage
+is split into categories; each entry is a `path regex` → `Block` rule. The
+list is extensible via config/DB.
+
+### Credentials & configuration
+
+```
+\.env(\.local|\.production|\.development)?$      # .env, .env.local, ...
+\.env\.[a-z]+$                                    # any .env.* variant
+config\.(php|json|yml|yaml|ini|conf)              # app configs
+secrets\.(json|yml|yaml)
+credentials\.(json|csv)
+\.htpasswd
+wp-config\.php
+local\.xml                                        # Magento
+settings\.php                                     # Drupal
+configuration\.php                                # Joomla
+```
+
+### SCM & directory metadata
+
+```
+/\.git/                                           # .git/, HEAD, config, index
+/\.svn/
+/\.hg/
+/\.bzr/
+/\.gitignore
+/\.gitattributes
+/\.dockerignore
+```
+
+### Cloud & infrastructure
+
+```
+/\.aws/                                           # credentials, config
+/\.ssh/                                           # id_rsa, id_ed25519, authorized_keys
+/\.gcp/
+/\.azure/
+/\.kube/                                          # kubeconfig
+/\.docker/                                        # config.json with registry tokens
+/\.terraform(\.tfstate)?
+```
+
+### Build files & artifacts
+
+```
+/(package-lock\.json|yarn\.lock|composer\.lock)   # optional: version info for recon
+/(docker-compose\.yml|docker-compose\.yaml)       # exposes service topology
+/(Dockerfile|Puppetfile|Vagrantfile)
+/\.npmrc                                          # npm tokens
+/\.pypirc                                         # pypi tokens
+/\.netrc                                          # HTTP creds
+```
+
+### Admin panels & known tools
+
+```
+/(wp-admin|wp-login\.php)                         # WordPress
+/(phpmyadmin|pma|phpMyAdmin)                      # phpMyAdmin
+/(adminer|adminer\.php)
+/(wp-content/uploads/phpmailer)                   # common exploit
+/manager/                                         # Tomcat manager
+/server-status                                    # Apache mod_status
+/server-info
+/nginx-status
+/fpm-status
+/actuator(/env|/heapdump|/threaddump)?            # sensitive Spring Boot actuator
+/health(/.*)?                                     # optional (may be legit)
+```
+
+### Backup & dump
+
+```
+\.(sql|bak|backup|old|swp|tmp|orig|save|copy)$
+/(dump|backup|db)\.(sql|tar|gz|zip|tgz)
+/www\.(zip|tar|gz|rar|7z)                         # full-site dumps
+```
+
+### System & dangerous exposures
+
+```
+/\.well-known/security\.txt$        # ALLOW (legitimate — RFC 9116) → explicit allowlist
+/\.DS_Store
+/Thumbs\.db
+/(etc/passwd|etc/shadow)             # path traversal via decode
+/(proc/self/environ|proc/self/fd/.*)
+```
+
+## Technical implementation
+
+- Each category is an individually toggleable *sub-pack* (`sentry rules
+  packs list` shows granular state).
+- The internal allowlist **always** permits `/.well-known/security.txt`
+  (RFC 9116 — public responsible disclosure document) even with the pack
+  active.
+- Case-insensitive match (`.ENV` == `.env`) to avoid trivial bypass.
+- Considers encodings: `%2e` (`.`), `%2f` (`/`), `..;/` (path traversal
+  smuggling), double-encoding — pre-match normalization.
+- Routes explicitly allowlisted by the user
+  (`[[rules.custom]] action = "allow"`) take priority over the pack,
+  allowing `/admin/` to be exposed if the app genuinely needs it.
+
+## Why `enforce` and not `shadow` from the start
+
+Accesses to `.git/`, `.env`, `.ssh/` are statistically 100% malicious in web
+apps (there's no legitimate reason for a browser to access these). The cost
+of a false positive here is zero versus the risk of leaking credentials.
+
+## Config in `sentry.toml`
+
+```toml
+[[rules.pack]]
+name = "sensitive_paths"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "vpn_proxy"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "tor"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "crawlers_bad"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "crawlers_good"
+mode  = "enforce"         # allow Googlebot etc.
+
+[[rules.pack]]
+name = "country_blocklist"
+mode  = "enforce"
+countries = ["RU","CN","KP"]   # ISO codes
+```

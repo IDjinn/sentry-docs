@@ -1,0 +1,75 @@
+---
+title: "Auto CLI"
+description: "sentry auto subcommands"
+---
+
+# Auto CLI
+
+The `sentry auto` subcommand detects the framework at the project root and
+generates `_sentry.auto.toml`_ (or merges into `sentry.toml`) with routes +
+rules + packs.
+
+## Commands
+
+```bash
+sentry auto                    # detects framework in cwd, generates sentry.auto.toml
+sentry auto --root /var/www    # specifies project root
+sentry auto --merge            # merge with existing sentry.toml
+sentry auto --dry-run          # only shows what it would detect, no write
+sentry auto --profile wordpress # force a profile (skip detection)
+sentry auto --deep             # AST scan of routes (slow, precise)
+sentry auto list-profiles      # lists supported profiles
+```
+
+## Flags
+
+| Flag                 | Description                                                    |
+|----------------------|----------------------------------------------------------------|
+| `--root <path>`      | Specifies the project root (default: cwd).                     |
+| `--merge`            | Merges the result into the existing `sentry.toml` instead of generating `sentry.auto.toml`. |
+| `--dry-run`          | Only shows what it would detect, does not write a file.        |
+| `--profile <name>`   | Forces a specific profile, skipping automatic detection.       |
+| `--deep`             | AST scan of routes via `tree-sitter` (slow, precise).          |
+
+## Output
+
+`_sentry.auto.toml`_ (or merge into `sentry.toml`) containing:
+
+- `[[routes.known]]` — exact detected routes
+- `[[rules.custom]]` — framework-specific rules
+- `[[rules.pack]]` — recommended packs (e.g. `sensitive_paths` in enforce)
+
+The user reviews, tweaks, and it's ready. `sentry run` loads both files.
+
+## Examples
+
+### Detect framework in cwd
+
+```bash
+sentry auto
+# → detected: Laravel 10.x
+# → 12 routes generated, 4 rules, 3 packs
+# → written: sentry.auto.toml
+```
+
+### Dry-run to see what it would detect
+
+```bash
+sentry auto --dry-run --deep
+# → framework: Rails 7.1
+# → routes (AST): 23 exact
+# → rules: protect /admin/*, rate-limit /login
+# → packs: sensitive_paths=enforce, crawlers_bad=enforce
+```
+
+### Merge directly into sentry.toml
+
+```bash
+sentry auto --merge --root /var/www
+```
+
+### Force a profile
+
+```bash
+sentry auto --profile wordpress
+```

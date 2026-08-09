@@ -1,0 +1,81 @@
+---
+title: "Quickstart"
+description: "Docker, local build and basic configuration"
+---
+
+# Quickstart
+
+## Docker (recommended for production)
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml up -d
+```
+
+Secrets go in environment variables, never in the config:
+
+```bash
+export SENTRY_CF_TOKEN=xxx        # Cloudflare API token (optional)
+export SENTRY_CF_ZONE=yyy         # Cloudflare zone ID (optional)
+export SENTRY_LLM_KEY=zzz         # OpenRouter key (optional)
+export SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
+```
+
+## Local build (development)
+
+```bash
+cargo build --release
+./target/debug/sentry config validate
+./target/debug/sentry run
+```
+
+> **Windows**: use the cargo from rustup
+> (`C:\Users\<user>\.cargo\bin\cargo.exe`), not the one from chocolatey.
+
+## Configuration
+
+Copy `config/sentry.example.toml` → `sentry.toml` and edit it. The env overlay
+(`SENTRY_<SECTION>__<KEY>`) overrides any field from the TOML.
+
+```toml
+[core]
+data_dir = "/var/lib/sentry"
+storage  = "postgres"
+
+[storage.postgres]
+url = "postgres://sentry:secret@localhost/sentry"
+
+[[source]]
+type   = "nginx"
+path   = "/var/log/nginx/access.log"
+format = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\""
+
+[analysis]
+risk_threshold_challenge = 50
+risk_threshold_block     = 75
+learn_unknown_routes     = true
+
+[[action]]
+type = "log"
+```
+
+## Running the monitor
+
+```bash
+sentry run                  # starts the daemon (foreground)
+sentry tail                # live tail of events with colored risk
+sentry tail --only High,Critical
+sentry config validate     # validates the config
+```
+
+## Rules and packs
+
+The rules engine runs **before** heuristics and AI (fast path). Precedence
+order: `Allow` > `Block`/`Challenge`/`RateLimit` > `Log`/`Tag` > falls
+through to heuristics + AI.
+
+Default packs: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`,
+`sensitive_paths`, `country_blocklist`, `http_anomaly`, `rate_scan`. Each
+pack runs in `shadow` (log only), `enforce` (act), or `off`.
+
+> **For production**: start with everything in `shadow` and observe the logs
+> before switching to `enforce`.

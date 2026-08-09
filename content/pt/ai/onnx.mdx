@@ -1,0 +1,63 @@
+---
+title: "Modelo ONNX Local"
+description: "Camada 1 — ThreatModel via ort (ONNX Runtime)"
+---
+
+# Modelo ONNX Local
+
+A Camada 1 do Sentry usa um modelo ONNX local para classificar payloads
+suspeitos que as heurísticas não conseguem decidir com confiança. Inferência
+local via `ort` (ONNX Runtime), sem depender de API externa.
+
+## Trait `ThreatModel`
+
+```rust
+// sentry-ai/src/threat.rs
+#[async_trait]
+pub trait ThreatModel: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn version(&self) -> &str;
+    async fn classify(&self, evt: &Event) -> anyhow::Result<ThreatVerdict>;
+}
+```
+
+A feature `onnx` é **opcional** e desligada por default. Ative via Cargo
+feature no build:
+
+```toml
+[dependencies]
+sentry-ai = { version = "0.1", features = ["onnx"] }
+```
+
+## Pipeline de treinamento
+
+1. **Dataset**: payloads maliciosos catalogados (SQLi, XSS, RCE, log4shell)
+   + tráfego benigno.
+2. **Treinamento offline** (Python, em `tools/train`) — produz um modelo
+   ONNX versionado.
+3. **Versionamento**: modelos em `models/` (ex: `models/sentry-payload-v1.onnx`).
+4. **Deploy**: binário carrega o modelo no startup; troca a quente via
+   `sentry model reload`.
+5. **Feedback loop**: incidentes confirmados pelo decisor viram dataset de
+   retreinamento.
+
+## Configuração
+
+```toml
+[analysis.ai]
+onnx_model = "models/sentry-payload-v1.onnx"
+llm_only_above = 30
+```
+
+## CLI
+
+```bash
+sentry model status             # versão do modelo, acurácia
+sentry model reload             # recarrega modelo do disco (hot swap)
+```
+
+## Status
+
+- Trait `ThreatModel` em `sentry-ai/src/threat.rs`.
+- Feature `onnx` existe no Cargo.toml.
+- **Impl ONNX pendente** (F2.1/F2.2) — sem `tools/` ainda.

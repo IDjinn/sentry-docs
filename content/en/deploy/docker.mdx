@@ -1,0 +1,84 @@
+---
+title: "Deploy with Docker"
+description: "Docker Compose and environment variables"
+---
+
+# Deploy with Docker
+
+Sentry is distributed with a `Dockerfile` and `docker-compose.yml` that bring
+up the binary + Postgres in a single command.
+
+## Docker Compose (recommended for production)
+
+```bash
+docker build -t sentry .
+docker compose -f deploy/docker/docker-compose.yml up -d
+```
+
+The compose file brings up two services:
+
+- `sentry` — the Sentry binary (reads nginx logs, runs the pipeline,
+  dispatches actions).
+- `postgres` — a Postgres database for events, incidents, rules, routes,
+  ip_state.
+
+## Environment variables
+
+Secrets go in env vars, never in committed config:
+
+```bash
+export SENTRY_CF_TOKEN=xxx        # Cloudflare API token (optional)
+export SENTRY_CF_ZONE=yyy         # Cloudflare zone ID (optional)
+export SENTRY_LLM_KEY=zzz         # OpenRouter key (optional)
+export SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
+```
+
+The env overlay (`SENTRY_<SECTION>__<KEY>`) overrides any field from the
+TOML.
+
+## Volumes
+
+- `/var/lib/sentry` — data dir (ONNX models, MMDB, local cache).
+- `/var/log/nginx` — access.log tailed by the nginx source.
+- Postgres data — volume managed by compose.
+
+## Config
+
+Mount your `sentry.toml` in the container (e.g. at `/etc/sentry/sentry.toml`)
+or use only env vars. Example `docker-compose.yml` override:
+
+```yaml
+services:
+  sentry:
+    image: sentry:latest
+    environment:
+      SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:secret@db/sentry
+      SENTRY_CF_TOKEN: ${SENTRY_CF_TOKEN}
+    volumes:
+      - ./sentry.toml:/etc/sentry/sentry.toml:ro
+      - /var/log/nginx:/var/log/nginx:ro
+      - sentry-data:/var/lib/sentry
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: sentry
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+volumes:
+  sentry-data:
+  pg-data:
+```
+
+## Logs
+
+Sentry uses `tracing` for structured logging. View the container logs:
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml logs -f sentry
+```

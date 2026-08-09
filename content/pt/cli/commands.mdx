@@ -1,0 +1,108 @@
+---
+title: "Referência de Comandos"
+description: "Subcomandos da CLI sentry"
+---
+
+# Referência de Comandos
+
+A CLI usa `clap` (derive) com subcomandos. Handlers reais em `cmd.rs`.
+
+## Monitor / daemon
+
+```bash
+sentry                          # inicia o monitor (daemon foreground)
+sentry daemon start|stop|status # modo service (opcional)
+sentry tail                     # live tail de eventos + risk colorido
+sentry tail --only High,Critical
+sentry run                      # inicia o daemon (alias)
+```
+
+## Incidentes
+
+```bash
+sentry incidents list           # lista incidentes
+sentry incidents show <id>
+```
+
+## IP
+
+```bash
+sentry ip info <ip>             # histórico, score, ASN, geo
+sentry ip block <ip> [--ttl 24h]
+sentry ip unblock <ip>
+```
+
+## Rotas
+
+```bash
+sentry routes list              # rotas conhecidas
+sentry routes learn             # modo baseline
+```
+
+## Relatórios
+
+```bash
+sentry report --from 24h        # relatório agregado
+sentry report --export json|csv
+```
+
+## Config
+
+```bash
+sentry config validate
+sentry config show
+```
+
+## Modelo de IA
+
+```bash
+sentry model status             # versão do modelo, acurácia
+sentry model reload
+```
+
+## Testes e detecção
+
+```bash
+sentry test detect "<payload>"  # roda pipeline em string isolada
+```
+
+## Cloudflare
+
+```bash
+sentry cloudflare status        # sincroniza estado
+sentry cloudflare pull          # importa logs existentes
+```
+
+## Rules engine
+
+```bash
+sentry rules list [--tag vpn] [--enabled] [--source db|config|feed]
+sentry rules show <id>
+sentry rules add --name "block admin from RU" \
+    --match 'country=RU AND path=/admin/*' --action block --priority 10
+sentry rules allow <ip> [--ttl 24h] [--note "monitoring agent"]
+sentry rules block <ip> [--ttl 24h] [--note "scan"]
+sentry rules allow-asn <asn> [--note "our DC"]
+sentry rules block-asn <asn>
+sentry rules enable <id>
+sentry rules disable <id>
+sentry rules delete <id>
+sentry rules import-feed spamhaus      # sincroniza reputation feed
+sentry rules packs list                # mostra packs e estado (shadow/enforce/off)
+sentry rules packs enable vpn_proxy --mode enforce
+sentry rules packs disable crawlers_good
+sentry rules test <ip>                 # simula: quais regras bateriam neste IP agora
+sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
+```
+
+## Sentry Auto
+
+```bash
+sentry auto                    # detecta framework na cwd, gera sentry.auto.toml
+sentry auto --root /var/www    # especifica raiz do projeto
+sentry auto --merge            # merge com sentry.toml existente
+sentry auto --dry-run          # só mostra o que detectaria, não escreve
+sentry auto --profile wordpress # forçar um perfil (skip detecção)
+sentry auto --deep             # AST scan de rotas (lento, preciso)
+sentry auto list-profiles      # lista perfis suportados
+```

@@ -1,0 +1,78 @@
+---
+title: "DSL de Match"
+description: "Mini-linguagem declarativa para expressões de match"
+---
+
+# DSL de Match
+
+A DSL de `match` é uma **mini-linguagem declarativa** para config e CLI
+(`ip=`, `asn=`, `country=`, `path=`, `path regex=`, `ua=`, `header.X=`,
+`method=`, `protocol=`, `reputation=`, `time=`, combináveis com `AND`/`OR`/
+`NOT` e parênteses). É parseada para `RuleMatch` em runtime. Mesma sintaxe
+da CLI `--match` e do `rules test`.
+
+O parser é um recursive-descent em `sentry-core/src/rules/dsl.rs` (14 testes).
+
+## Operadores suportados
+
+| Campo        | Operador  | Exemplo                                            |
+|--------------|-----------|----------------------------------------------------|
+| IP           | `ip=`     | `ip=10.0.0.0/8`, `ip=192.168.1.1`                  |
+| ASN          | `asn=`    | `asn=14061`                                        |
+| País         | `country=`| `country=RU`                                       |
+| Path         | `path=`   | `path=/admin/*` (glob), `path regex=^/api/.*$`     |
+| User-Agent   | `ua=`     | `ua contains sqlmap`, `ua=python-requests`         |
+| Header       | `header.X=` | `header.X-Forwarded-For contains 1.2.3.4`       |
+| Método       | `method=` | `method=POST`                                      |
+| Protocolo    | `protocol=` | `protocol=Http`                                  |
+| Reputation   | `reputation=` | `reputation=Tor`                             |
+| Status       | `status=` | `status=404`                                       |
+| Tempo        | `time=`   | `time outside(09:00-18:00 America/Sao_Paulo)`     |
+
+## Operadores de string
+
+- `equals` (default quando só `=`)
+- `contains`
+- `startswith`
+- `regex=`
+
+## Combinadores lógicos
+
+- `AND` (comutativo)
+- `OR`
+- `NOT`
+- Parênteses `(` `)` para agrupar
+
+## Exemplos
+
+```toml
+[[rules.custom]]
+name = "allow internal monitoring"
+priority = 1
+match = 'ip=10.0.0.0/8'
+action = "allow"
+
+[[rules.custom]]
+name = "challenge datacenter ASN outside business hours"
+priority = 20
+match = 'asn=14061 AND time outside(09:00-18:00 America/Sao_Paulo)'
+action = "challenge"
+
+[[rules.custom]]
+name = "block admin from RU"
+priority = 10
+match = 'country=RU AND path=/admin/*'
+action = "block"
+```
+
+## Uso na CLI
+
+```bash
+sentry rules add --name "block admin from RU" \
+    --match 'country=RU AND path=/admin/*' --action block --priority 10
+
+sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
+```
+
+O `sentry rules test` simula quais regras bateriam em um evento hipotético,
+útil para validar regras antes de promovê-las para `enforce`.

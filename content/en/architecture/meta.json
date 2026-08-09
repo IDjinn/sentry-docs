@@ -1,0 +1,4 @@
+{
+  "title": "Architecture",
+  "pages": ["index", "data-model", "request-flow", "risk-levels", "daemon-lifecycle"]
+}

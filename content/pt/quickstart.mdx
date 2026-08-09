@@ -1,0 +1,81 @@
+---
+title: "Início Rápido"
+description: "Docker, build local e configuração básica"
+---
+
+# Início Rápido
+
+## Docker (recomendado para produção)
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml up -d
+```
+
+Segredos vão em variáveis de ambiente, nunca no config:
+
+```bash
+export SENTRY_CF_TOKEN=xxx        # Cloudflare API token (opcional)
+export SENTRY_CF_ZONE=yyy         # Cloudflare zone ID (opcional)
+export SENTRY_LLM_KEY=zzz         # OpenRouter key (opcional)
+export SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
+```
+
+## Build local (desenvolvimento)
+
+```bash
+cargo build --release
+./target/debug/sentry config validate
+./target/debug/sentry run
+```
+
+> **Windows**: use o cargo do rustup
+> (`C:\Users\<user>\.cargo\bin\cargo.exe`), não o do chocolatey.
+
+## Configuração
+
+Copie `config/sentry.example.toml` → `sentry.toml` e edite. O overlay de env
+(`SENTRY_<SECTION>__<KEY>`) sobrescreve qualquer campo do TOML.
+
+```toml
+[core]
+data_dir = "/var/lib/sentry"
+storage  = "postgres"
+
+[storage.postgres]
+url = "postgres://sentry:secret@localhost/sentry"
+
+[[source]]
+type   = "nginx"
+path   = "/var/log/nginx/access.log"
+format = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\""
+
+[analysis]
+risk_threshold_challenge = 50
+risk_threshold_block     = 75
+learn_unknown_routes     = true
+
+[[action]]
+type = "log"
+```
+
+## Rodando o monitor
+
+```bash
+sentry run                  # inicia o daemon (foreground)
+sentry tail                # live tail de eventos + risk colorido
+sentry tail --only High,Critical
+sentry config validate     # valida a config
+```
+
+## Rules e packs
+
+O rules engine roda **antes** das heurísticas e da IA (fast path). Ordem de
+precedência: `Allow` > `Block`/`Challenge`/`RateLimit` > `Log`/`Tag` > cai
+para heurísticas + IA.
+
+Packs default: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`,
+`sensitive_paths`, `country_blocklist`, `http_anomaly`, `rate_scan`. Cada
+pack roda em `shadow` (log only), `enforce` (act), ou `off`.
+
+> **Para produção**: comece com tudo em `shadow` e observe os logs antes de
+> trocar para `enforce`.

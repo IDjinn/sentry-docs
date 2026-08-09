@@ -1,0 +1,72 @@
+---
+title: "LLM Provider"
+description: "Layer 2 — LLM provider-agnostic via the LlmProvider trait"
+---
+
+# LLM Provider
+
+Sentry's Layer 2 uses an LLM **on demand** for Medium events without a clear
+verdict from previous layers. Sentry is **provider-agnostic**: it never calls
+an LLM API directly, always through a trait. This lets you swap model/provider
+without changing code — only config. The **OpenRouter** adapter is recommended
+as default because a single endpoint routes to any model (Claude, GPT, Gemini,
+Qwen, Llama, DeepSeek…), useful to experiment with cost vs. quality.
+
+## `LlmProvider` trait
+
+```rust
+// sentry-ai/src/llm.rs
+#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    fn name(&self) -> &'static str;            // "openrouter" | "ollama" | "openai" | "anthropic"...
+    fn model_id(&self) -> &str;                // ex: "anthropic/claude-3.5-sonnet"
+    async fn classify(&self, req: ClassifyRequest) -> anyhow::Result<ClassifyResponse>;
+    async fn explain(&self, req: ExplainRequest) -> anyhow::Result<String>;
+}
+
+pub struct ClassifyRequest {
+    pub protocol: ProtocolData,    // works for Http, Tcp, etc.
+    pub context: String,           // truncated summary: path, key headers, payload preview
+    pub schema: JsonSchema,        // mandatory structured response
+}
+pub struct ClassifyResponse {
+    pub verdict: Verdict,
+    pub risk_score: u8,
+    pub signals: Vec<String>,
+    pub confidence: f32,           // 0.0–1.0
+}
+```
+
+## Adapters
+
+Each adapter in its own module/feature:
+
+| Provider             | Endpoint                                          | Auth                            |
+|----------------------|---------------------------------------------------|---------------------------------|
+| `OpenRouterProvider` | `POST https://openrouter.ai/api/v1/chat/completions` | `Authorization: Bearer $SENTRY_LLM_KEY` |
+| `OllamaProvider`     | `http://localhost:11434/api/chat` (local, no key) | —                               |
+| `OpenAiProvider`     | `api.openai.com` (via `async-openai`)             | `OPENAI_API_KEY`                |
+| `AnthropicProvider`  | `api.anthropic.com` (messages API)               | `ANTHROPIC_API_KEY`             |
+| `MockProvider`       | For deterministic tests                            | —                               |
+
+The OpenRouter adapter sends `body: { model, messages, response_format:
+json_schema }` and the response is validated against the mandatory JSON
+schema.
+
+## Config-driven selection
+
+```toml
+[analysis.ai]
+llm_provider = "openrouter"        # none | openai | ollama | openrouter | anthropic
+llm_model = "anthropic/claude-3.5-sonnet"
+llm_only_above = 30                 # only triggers LLM if risk_score > 30
+```
+
+Switching to Ollama = change 2 lines. A verdict cache keyed by payload hash
+avoids calling the LLM again for identical payloads within a short window.
+
+## Open decisions (to validate)
+
+- **Default LLM**: **Ollama local** recommended (no cost, no data leak).
+  OpenAI is opt-in.
+- The LLM should only be triggered on **< 2% of events** (controlled cost).

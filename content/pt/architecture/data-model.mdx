@@ -1,0 +1,135 @@
+---
+title: "Modelo de Dados"
+description: "Event, ProtocolData e helpers de protocolo"
+---
+
+# Modelo de Dados
+
+O `Event` é **modular por design**: campos comuns a qualquer origem vivem no
+top-level; o que é específico de protocolo fica em `ProtocolData` (enum
+extensível). Hoje `Http` cobre nginx; amanhã `Tcp`, `Udp`, `Tls` etc. entram
+sem mudar o core — basta a source popular a variante correspondente. As
+heurísticas e o scorer operam sobre o `Event` e fazem *pattern matching* em
+`protocol`, ignorando campos ausentes.
+
+```rust
+// sentry-core/src/event.rs
+pub struct Event {
+    // --- comuns a qualquer protocolo ---
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub source: SourceKind,          // Nginx, Tcp, HttpProxy, CloudflareLogs...
+    pub transport: Transport,        // Tcp | Udp | Tls | Internal
+    pub client_ip: IpAddr,
+    pub client_port: Option<u16>,
+    pub server_port: Option<u16>,    // porta exposta observada
+    pub geo: Option<GeoInfo>,
+    pub asn: Option<u32>,
+    pub direction: Direction,        // Inbound | Outbound
+    pub bytes_in: Option<u64>,
+    pub bytes_out: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub raw: Option<String>,         // registro original p/ auditoria
+
+    // --- específico do protocolo ---
+    pub protocol: ProtocolData,
+}
+
+pub enum ProtocolData {
+    Http(HttpData),
+    Tcp(TcpData),
+    Udp(UdpData),
+    TlsHandshake(TlsData),
+    Raw(RawData),                    // fallback: bytes + nota
+    // futuras variantes entram aqui sem quebrar consumidores
+}
+
+pub struct HttpData {
+    pub method: HttpMethod,
+    pub scheme: Option<String>,      // http | https
+    pub host: Option<String>,
+    pub path: String,
+    pub query: Option<String>,
+    pub fragment: Option<String>,
+    pub status: Option<u16>,
+    pub user_agent: Option<String>,
+    pub referer: Option<String>,
+    pub headers: HashMap<String, String>,
+    pub body: Option<Vec<u8>>,       // quando disponível (proxy/middleware)
+    pub cookies: Option<HashMap<String, String>>,
+}
+
+pub struct TcpData {
+    pub flags: TcpFlags,             // syn/fin/rst/ack...
+    pub payload: Option<Vec<u8>>,    // bytes do stream reconstruído (quando capturável)
+    pub stream_id: Option<u64>,      // p/ correlacionar segmentos
+    pub stage: TcpStage,             // Syn | SynAck | Data | Fin | Reset
+}
+
+pub struct UdpData {
+    pub payload: Option<Vec<u8>>,
+    pub dns_query: Option<String>,   // se for DNS reconhecido
+}
+
+pub struct TlsData {
+    pub sni: Option<String>,
+    pub ja3: Option<String>,         // fingerprint TLS
+    pub ja4: Option<String>,
+    pub cipher: Option<String>,
+    pub version: Option<String>,
+}
+
+pub struct RawData {
+    pub note: String,
+    pub bytes: Vec<u8>,
+}
+
+// Helpers de ergonomia: e.kind_http() -> Option<&HttpData> etc.
+impl Event {
+    pub fn http(&self)  -> Option<&HttpData>  { match &self.protocol { ProtocolData::Http(d) => Some(d), _ => None } }
+    pub fn tcp(&self)   -> Option<&TcpData>   { match &self.protocol { ProtocolData::Tcp(d) => Some(d), _ => None } }
+    pub fn tls(&self)   -> Option<&TlsData>   { match &self.protocol { ProtocolData::TlsHandshake(d) => Some(d), _ => None } }
+    pub fn is_http(&self) -> bool { matches!(self.protocol, ProtocolData::Http(_)) }
+}
+```
+
+> **Regra**: nenhum estágio do pipeline pode assumir `ProtocolData::Http`.
+> Heurísticas HTTP verificam `evt.http()` e retornam `None` para outras
+> variantes; heurísticas TCP fazem o análogo. Assim o mesmo pipeline roda
+> para nginx hoje e para captura TCP amanhã.
+
+## AnalysisResult
+
+```rust
+pub struct AnalysisResult {
+    pub risk_score: u8,               // 0..=100
+    pub risk_level: RiskLevel,        // Info|Low|Medium|High|Critical
+    pub signals: Vec<Signal>,         // o que disparou
+    pub verdict: Verdict,             // Allow|Challenge|Block|Quarantine
+}
+
+pub enum Signal {
+    PathTraversal, SqlInjection, Xss, CmdInjection,
+    UnknownRoute, ScanBehavior, AbnormalRate,
+    SuspiciousUA, TorExitNode, KnownBadIp,
+    AnomalousPayload(/* modelo */),
+    Custom(String),
+}
+```
+
+## Adicionando um novo protocolo
+
+Ao adicionar um novo protocolo:
+
+1. Adicione uma variante a `ProtocolData`.
+2. Adicione um helper em `impl Event` (ex: `pub fn meu_proto(&self) -> Option<&MeuData>`).
+3. Atualize `protocol_kind()`.
+4. **Não** adicione campos soltos no `Event` top-level — coloque no enum.
+
+## Normalização de encoding (heurísticas)
+
+Heurísticas (SQLi, XSS, path traversal, etc.) rodam sobre a forma
+**URL-decodificada** do path/query (`heuristics::http_text`), para que
+payloads encodados (`%27` = `'`, `+` ou `%20` = espaço) não façam bypass.
+Ao escrever novas heurísticas, sempre use `http_text(http)` em vez de ler
+`http.path` / `http.query` diretamente.

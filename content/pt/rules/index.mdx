@@ -1,0 +1,123 @@
+---
+title: "Rules Engine"
+description: "Motor de regras determinístico WAF-style"
+---
+
+# Rules Engine
+
+O Sentry tem um **motor de regras determinístico** que roda **antes** das
+heurísticas e da IA — é o "fast path". Inspirado nas Custom Rules / WAF da
+Cloudflare: cada regra é um *match* + *action*, avaliada em ordem de
+prioridade, com **short-circuit**. Regras são a primeira linha de defesa
+(bloqueio instantâneo de VPNs, crawlers, ASNs, países) e também a fonte de
+**allowlists** (IPs/ASNs confiáveis que bypassam todo o scoring).
+
+## Modelo
+
+```rust
+// sentry-core/src/rules.rs
+pub struct Rule {
+    pub id: RuleId,
+    pub name: String,
+    pub priority: i32,              // menor = avalia primeiro
+    pub enabled: bool,
+    pub match_: RuleMatch,          // condição (combinável com AND/OR)
+    pub action: RuleAction,
+    pub ttl: Option<Duration>,      // regras dinâmicas expiram (ex: block temporário)
+    pub source: RuleSource,         // Config | Db | CloudflareSync | AutoLearned
+    pub tags: Vec<String>,          // ex: "default", "vpn", "crawler"
+}
+
+pub enum RuleAction {
+    Allow,                          // bypassa scoring + AI (allowlist absoluta)
+    Block,
+    Challenge,                      // Cloudflare managed/js challenge
+    RateLimit { req_per_sec: u32, window: Duration },
+    Log,                            // só registra, não age (modo shadow)
+    Tag(String),                    // anota o evento, continua pipeline
+}
+
+// Expressões combináveis — mesma ideia de matchers da CF
+pub enum RuleMatch {
+    Ip(IpMatcher),                 // IP exato | CIDR | range
+    Asn(u32),
+    Country(IsoCode),
+    Path(PathMatcher),             // exato | glob | regex
+    Method(HttpMethod),
+    Header { name: String, op: StrOp },
+    UserAgent(StrOp),
+    Query(StrOp),
+    Body(StrOp),                   // quando disponível
+    Protocol(ProtocolKind),        // Http | Tcp | Tls...
+    TlsFingerprint { ja3: Option<String>, ja4: Option<String> },
+    Reputation(ReputationTier),    // Clean | Suspicious | Malicious | Datacenter | Vpn | Tor
+    Status(u16),                   // ex: status == 404
+    Rate { count: u32, per: Duration, scope: RateScope },
+    Time { window: TimeWindow },   // só ativa em horário comercial etc.
+    All(Vec<RuleMatch>),           // AND
+    Any(Vec<RuleMatch>),           // OR
+    Not(Box<RuleMatch>),
+}
+
+pub enum IpMatcher { Single(IpAddr), Cidr(IpCidr), Range { from: IpAddr, to: IpAddr } }
+pub enum StrOp { Equals(String), Contains(String), Regex(Regex), StartsWith(String), In(Vec<String>) }
+```
+
+## Precedência no pipeline
+
+<Mermaid chart={`
+flowchart LR
+    EVT[Evento normalizado] --> R{Rules Engine<br/>avalia em prioridade}
+    R -->|Allow rule hit| BY[Allow + bypass scoring/AI]
+    R -->|Block/Challenge/RateLimit hit| ACT[Executa Action<br/>+ short-circuit]
+    R -->|Log/Tag hit| AN[Anota + continua]
+    R -->|nenhuma regra| HEUR[Heurísticas → IA → Scorer]
+    BY --> PERSIST[Persistir]
+    ACT --> PERSIST
+    AN --> HEUR
+    HEUR --> PERSIST
+`} />
+
+Ordem: **Allowlist** (trust absoluto) > **Blocklist explícita** >
+**Reputation/VPN/Tor defaults** > **Crawler/UA defaults** > **path
+sensíveis** > (cai para heurísticas+IA). Allowlist é o *escape hatch* para
+evitar falso-positivo em IPs próprios (healthchecks, monitoring, CI).
+
+## Fontes de regras
+
+1. **Config (`sentry.toml`)** — regras estáticas, versionadas com o app.
+2. **Postgres (`rules` table)** — regras dinâmicas criadas via CLI/dashboard,
+   hot-reload sem reiniciar.
+3. **Cloudflare sync** — importa Custom Rules/WAF da CF como regras locais
+   (espelho) para decisão local em modo inline futuro.
+4. **Auto-learned** — IPs confirmados como maliciosos pelo decisor viram
+   regra dinâmica `Block` com TTL (feedback loop).
+5. **Reputation feeds** — blocklists públicas (Spamhaus DROP, Emerging
+   Threats, FireHOL) sincronizadas periodicamente → viram regras `Block`
+   tagadas `feed:spamhaus`.
+
+Hot-reload: o daemon observa a tabela `rules` (Postgres `LISTEN/NOTIFY`) e
+atualiza um `Arc<RwLock<RuleSet>>` em memória sem restart. Avaliação é
+indexada por IP-hash/ASN/country para não iterar todas as regras por evento.
+
+## CLI de gestão de regras
+
+```bash
+sentry rules list [--tag vpn] [--enabled] [--source db|config|feed]
+sentry rules show <id>
+sentry rules add --name "block admin from RU" \
+    --match 'country=RU AND path=/admin/*' --action block --priority 10
+sentry rules allow <ip> [--ttl 24h] [--note "monitoring agent"]
+sentry rules block <ip> [--ttl 24h] [--note "scan"]
+sentry rules allow-asn <asn> [--note "our DC"]
+sentry rules block-asn <asn>
+sentry rules enable <id>
+sentry rules disable <id>
+sentry rules delete <id>
+sentry rules import-feed spamhaus      # sincroniza reputation feed
+sentry rules packs list                # mostra packs e estado (shadow/enforce/off)
+sentry rules packs enable vpn_proxy --mode enforce
+sentry rules packs disable crawlers_good
+sentry rules test <ip>                 # simula: quais regras bateriam neste IP agora
+sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
+```

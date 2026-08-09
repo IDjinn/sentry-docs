@@ -1,0 +1,30 @@
+---
+title: "Sentry"
+description: "Monitor de acessos em tempo real com detecção de ameaças por IA"
+---
+
+# Sentry
+
+O **Sentry** é um observador de acessos em tempo real para serviços expostos à internet. Começa monitorando o **nginx** (via access logs), mas é desenhado para escalar para **qualquer porta/protocolo** (HTTP, TCP, proxies reversos, packet capture, syslog). Usa IA + heurísticas para detectar payloads maliciosos, comportamento suspeito, rotas inválidas e calcula um **nível de risco** por requisição/IP. Integra-se com **Cloudflare** para challenge/block em camada de edge.
+
+## Características principais
+
+- **Modularidade total**: cada origem de dados (nginx, tcp, http-proxy) é um plugin por trás de um trait comum.
+- **Tempo real**: stream de eventos, não batch.
+- **Precisão**: combinar regras determinísticas (rápidas, zero falso-positivo conhecido) com IA (para o desconhecido).
+- **Ação**: não apenas detectar — bloquear, desafiar, rate-limitar.
+- **Multi-plataforma**: um único binário em Rust.
+- **Operável**: CLI rica para tail ao vivo, relatórios, export, gestão de blocklist.
+
+## Documentação
+
+- [Visão geral](./overview) — objetivos, não-objetivos, o que é o Sentry.
+- [Início rápido](./quickstart) — Docker, build local, configuração básica.
+- [Arquitetura](./architecture) — pipeline, modelo de dados, fluxo de requisição.
+- [Rules Engine](./rules) — regras determinísticas, DSL, packs.
+- [Plugins](./plugins) — traits `Source` e `Action`, challenge providers.
+- [IA](./ai) — heurísticas, ONNX local, LLM opcional.
+- [CLI & TUI](./cli) — referência de comandos e interface interativa.
+- [Configuração](./config) — referência do `sentry.toml`.
+- [Sentry Auto](./auto) — detecção de framework e geração automática de regras.
+- [Deploy](./deploy) — Docker, Kubernetes, Vercel.

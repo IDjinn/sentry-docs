@@ -1,0 +1,44 @@
+---
+title: "Ciclo de Vida do Daemon"
+description: "Estados do daemon do Sentry"
+---
+
+# Ciclo de Vida do Daemon
+
+O daemon do Sentry passa por um conjunto bem definido de estados: carrega e
+valida a config, sobe as sources, entra em streaming, analisa eventos,
+decide vereditos, executa actions, persiste e (em `SIGINT`/`SIGTERM`) faz
+graceful shutdown.
+
+<Mermaid chart={`
+stateDiagram-v2
+    [*] --> LoadingConfig
+    LoadingConfig --> ValidatingConfig
+    ValidatingConfig --> StartingSources: ok
+    ValidatingConfig --> [*]: erro fatal
+    StartingSources --> Streaming
+    Streaming --> Analyzing: evento bruto
+    Analyzing --> Deciding
+    Deciding --> ExecutingActions: verdict != Allow
+    Deciding --> Streaming: Allow
+    ExecutingActions --> Persisting
+    Persisting --> Streaming
+    Streaming --> GracefulShutdown: SIGINT/SIGTERM
+    GracefulShutdown --> [*]
+`} />
+
+## Detalhes por estado
+
+- **LoadingConfig** — carrega `sentry.toml` + overlay de env (`SENTRY_*`).
+- **ValidatingConfig** — valida schema, paths de sources, ações ativas. Em
+  erro fatal, aborta com `color-eyre` report legível.
+- **StartingSources** — instancia cada plugin `Source` habilitado e abre o
+  canal de streaming.
+- **Streaming** — aguarda eventos brutos do canal.
+- **Analyzing** — normaliza, dedupe (LRU TTL 10s), enriquece com geo/ASN,
+  roda rules engine → heurísticas → IA → scorer.
+- **Deciding** — aplica a política de veredito (`AnalysisResult` → `Decision`).
+- **ExecutingActions** — despacha para as actions registradas (blocklist,
+  webhook, Cloudflare, log…). Spawn async para não bloquear o stream.
+- **Persisting** — grava evento + incidente no Postgres (async spawn).
+- **GracefulShutdown** — fecha canais, agrega drenagem, fecha DB, sai.

@@ -1,0 +1,143 @@
+---
+title: "Referência de Config"
+description: "sentry.toml e overlay de env vars"
+---
+
+# Referência de Config (`sentry.toml`)
+
+A configuração é declarativa em TOML, com overlay de variáveis de ambiente
+via `figment` (prefixo `SENTRY_`, separador `__`). O overlay sobrescreve
+qualquer campo do TOML — útil em prod para segredos.
+
+## Arquivo completo de exemplo
+
+```toml
+[core]
+data_dir = "/var/lib/sentry"
+storage  = "sqlite"        # sqlite | postgres
+
+[storage.postgres]
+url = "postgres://..."
+
+[[source]]
+type   = "nginx"
+path   = "/var/log/nginx/access.log"
+format = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\""
+
+[[source]]
+type = "cloudflare"
+zone = "example.com"
+poll_secs = 30
+
+[analysis]
+risk_threshold_challenge = 50
+risk_threshold_block     = 75
+learn_unknown_routes     = true
+
+[analysis.ai]
+onnx_model = "models/sentry-payload-v1.onnx"
+llm_provider = "ollama"      # none | openai | ollama
+llm_model = "qwen2.5:7b"
+llm_only_above = 30
+
+[geo]
+db_path = "/var/lib/sentry/GeoLite2-City.mmdb"
+
+[scorer]
+# pesos dos sinais (sobrescreve defaults)
+
+[routes]
+known = [
+  { path = "/", methods = ["GET"] },
+  { path = "/api/users", methods = ["GET","POST"] },
+  { path = "/admin/*", methods = ["GET"], auth_required = true },
+]
+
+[[action]]
+type = "cloudflare"
+mode = "managed_challenge"
+ttl_hours = 24
+
+[[action]]
+type = "webhook"
+url = "https://discord.com/api/webhooks/..."
+on_levels = ["High","Critical"]
+
+[[action]]
+type = "log"   # sempre
+
+# Rules engine
+[[rules.pack]]
+name = "sensitive_paths"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "vpn_proxy"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "tor"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "crawlers_bad"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "crawlers_good"
+mode  = "enforce"         # allow Googlebot etc.
+
+[[rules.pack]]
+name = "country_blocklist"
+mode  = "enforce"
+countries = ["RU","CN","KP"]   # ISO codes
+
+# regras estáticas inline (além das do DB)
+[[rules.custom]]
+name = "allow internal monitoring"
+priority = 1
+match = 'ip=10.0.0.0/8'
+action = "allow"
+
+[[rules.custom]]
+name = "challenge datacenter ASN outside business hours"
+priority = 20
+match = 'asn=14061 AND time outside(09:00-18:00 America/Sao_Paulo)'
+action = "challenge"
+
+# reputation feeds
+[[rules.feed]]
+name = "spamhaus_drop"
+url  = "https://www.spamhaus.org/drop/drop.txt"
+refresh_hours = 24
+action = "block"
+```
+
+## Overlay de variáveis de ambiente
+
+Qualquer campo do TOML pode ser sobrescrito via env var no formato
+`SENTRY_<SECTION>__<KEY>` (path em uppercase, `__` separa níveis de
+objeto). Exemplos:
+
+| Env var                                   | Sobrescreve                          |
+|-------------------------------------------|--------------------------------------|
+| `SENTRY_STORAGE__POSTGRES__URL`            | `[storage.postgres] url`             |
+| `SENTRY_CF_TOKEN`                          | Token Cloudflare (não no TOML)       |
+| `SENTRY_CF_ZONE`                           | Zone ID Cloudflare (não no TOML)     |
+| `SENTRY_LLM_KEY`                           | OpenRouter key (não no TOML)          |
+| `SENTRY_ANALYSIS__AI__LLM_PROVIDER`        | `[analysis.ai] llm_provider`         |
+
+## Segurança
+
+- Segredos (tokens Cloudflare, LLM, DB) **nunca** em config commitada. Via
+  env.
+- `sentry.example.toml` tem placeholders, não valores reais.
+- O `sensitive_paths` pack bloqueia `.env`, `.git/`, `.ssh/`, etc. por
+  default — ao expor uma rota allowlistada, justifique no PR.
+
+## Validação
+
+```bash
+sentry config validate     # valida schema, paths, actions
+sentry config show         # mostra config efetiva (com overlay resolvido)
+```

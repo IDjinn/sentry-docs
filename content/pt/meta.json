@@ -1,0 +1,23 @@
+{
+  "title": "Sentry",
+  "pages": [
+    "overview",
+    "quickstart",
+    "---Architecture",
+    "[architecture]architecture",
+    "---Rules Engine",
+    "[rules]rules",
+    "---Plugins",
+    "[plugins]plugins",
+    "---IA",
+    "[ai]ai",
+    "---CLI",
+    "[cli]cli",
+    "---Configuração",
+    "[config]config",
+    "---Sentry Auto",
+    "[auto]auto",
+    "---Deploy",
+    "[deploy]deploy"
+  ]
+}

@@ -1,0 +1,75 @@
+---
+title: "Auto CLI"
+description: "Subcomandos do sentry auto"
+---
+
+# Auto CLI
+
+O subcomando `sentry auto` detecta o framework na raiz do projeto e gera
+`_sentry.auto.toml`_ (ou merge em `sentry.toml`) com rotas + regras + packs.
+
+## Comandos
+
+```bash
+sentry auto                    # detecta framework na cwd, gera sentry.auto.toml
+sentry auto --root /var/www    # especifica raiz do projeto
+sentry auto --merge            # merge com sentry.toml existente
+sentry auto --dry-run          # só mostra o que detectaria, não escreve
+sentry auto --profile wordpress # forçar um perfil (skip detecção)
+sentry auto --deep             # AST scan de rotas (lento, preciso)
+sentry auto list-profiles      # lista perfis suportados
+```
+
+## Flags
+
+| Flag                 | Descrição                                                    |
+|----------------------|--------------------------------------------------------------|
+| `--root <path>`      | Especifica a raiz do projeto (default: cwd).                 |
+| `--merge`            | Mescla o resultado com `sentry.toml` existente em vez de gerar `sentry.auto.toml`. |
+| `--dry-run`          | Só mostra o que detectaria, não escreve arquivo.             |
+| `--profile <name>`   | Força um perfil específico, pulando a detecção automática.   |
+| `--deep`             | AST scan de rotas via `tree-sitter` (lento, preciso).         |
+
+## Saída
+
+`_sentry.auto.toml`_ (ou merge em `sentry.toml`) contendo:
+
+- `[[routes.known]]` — rotas exatas detectadas
+- `[[rules.custom]]` — regras específicas do framework
+- `[[rules.pack]]` — packs recomendados (ex: `sensitive_paths` em enforce)
+
+O usuário revisa, ajusta, e pronto. O `sentry run` carrega ambos os
+arquivos.
+
+## Exemplos
+
+### Detectar framework na cwd
+
+```bash
+sentry auto
+# → detectado: Laravel 10.x
+# → 12 rotas geradas, 4 regras, 3 packs
+# → escrito: sentry.auto.toml
+```
+
+### Dry-run para ver o que detectaria
+
+```bash
+sentry auto --dry-run --deep
+# → framework: Rails 7.1
+# → rotas (AST): 23 exatas
+# → regras: protect /admin/*, rate-limit /login
+# → packs: sensitive_paths=enforce, crawlers_bad=enforce
+```
+
+### Merge direto em sentry.toml
+
+```bash
+sentry auto --merge --root /var/www
+```
+
+### Forçar um perfil
+
+```bash
+sentry auto --profile wordpress
+```

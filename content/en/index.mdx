@@ -1,0 +1,30 @@
+---
+title: "Sentry"
+description: "Real-time access monitor with AI-powered threat detection"
+---
+
+# Sentry
+
+**Sentry** is a real-time access monitor for services exposed to the internet. It starts by monitoring **nginx** (via access logs) but is designed to scale to **any port/protocol** (HTTP, TCP, reverse proxies, packet capture, syslog). It uses AI + heuristics to detect malicious payloads, suspicious behavior, and invalid routes, and computes a **risk level** per request/IP. It integrates with **Cloudflare** for edge-layer challenge/block.
+
+## Key features
+
+- **Total modularity**: each data source (nginx, tcp, http-proxy) is a plugin behind a common trait.
+- **Real time**: event streaming, not batch.
+- **Precision**: combine deterministic rules (fast, zero known false positives) with AI (for the unknown).
+- **Action**: not only detect — block, challenge, rate-limit.
+- **Cross-platform**: a single Rust binary.
+- **Operable**: rich CLI for live tail, reports, export, blocklist management.
+
+## Documentation
+
+- [Overview](./overview) — goals, non-goals, what Sentry is.
+- [Quickstart](./quickstart) — Docker, local build, basic configuration.
+- [Architecture](./architecture) — pipeline, data model, request flow.
+- [Rules Engine](./rules) — deterministic rules, DSL, packs.
+- [Plugins](./plugins) — `Source` and `Action` traits, challenge providers.
+- [AI](./ai) — heuristics, local ONNX, optional LLM.
+- [CLI & TUI](./cli) — command reference and interactive interface.
+- [Configuration](./config) — `sentry.toml` reference.
+- [Sentry Auto](./auto) — framework detection and automatic rule generation.
+- [Deploy](./deploy) — Docker, Kubernetes, Vercel.

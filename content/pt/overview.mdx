@@ -1,0 +1,50 @@
+---
+title: "Visão Geral"
+description: "O que é o Sentry, objetivos e não-objetivos"
+---
+
+# Visão Geral
+
+O **Sentry** é um observador de acessos em tempo real para serviços expostos à internet. Começa monitorando o **nginx** (via access logs), mas é desenhado para escalar para **qualquer porta/protocolo** (HTTP, TCP, proxies reversos, packet capture, syslog). Usa IA + heurísticas para detectar payloads maliciosos, comportamento suspeito, rotas inválidas e calcula um **nível de risco** por requisição/IP. Integra-se com **Cloudflare** para challenge/block em camada de edge.
+
+## Objetivos
+
+- **Modularidade total**: cada origem de dados (nginx, tcp, http-proxy) é um plugin por trás de um trait comum.
+- **Tempo real**: stream de eventos, não batch.
+- **Precisão**: combinar regras determinísticas (rápidas, zero falso-positivo conhecido) com IA (para o desconhecido).
+- **Ação**: não apenas detectar — bloquear, desafiar, rate-limitar.
+- **Multi-plataforma**: um único binário em Rust.
+- **Operável**: CLI rica para tail ao vivo, relatórios, export, gestão de blocklist.
+
+## Não-objetivos (fase atual)
+
+- Dashboard web (fase futura, via Tauri ou backend HTTP separado).
+- Substituir um WAF comercial — é complementar.
+- Deep packet inspection de protocolos não-HTTP na fase 1.
+
+## Por que existe
+
+WAFs comerciais cobrem o óbvio. O Sentry cobre o **resto**: payloads encodados, scanning de paths sensíveis, crawlers maliciosos, padrões de acesso anômalos — combinando regras rápidas (zero falso-positivo conhecido) com IA para o desconhecido. Tudo em um único binário Rust, rodando localmente, sem enviar seus logs para terceiros.
+
+## Stack técnica
+
+| Camada            | Tecnologia                                          |
+|-------------------|-----------------------------------------------------|
+| Async runtime     | `tokio`                                             |
+| CLI               | `clap` (derive) + `ratatui` (TUI) + crossterm       |
+| Storage           | Postgres (`sqlx`, migrations sqlx)                  |
+| Config            | `figment` (TOML + env overlay, prefixo `SENTRY_`)   |
+| HTTP client       | `reqwest` (native-tls no Windows / rustls em containers) |
+| IA                | `ort` (ONNX, local) + trait `LlmProvider`            |
+| Edge actions      | trait `ChallengeProvider` (Cloudflare, …)           |
+| Geo/ASN           | `maxminddb` (GeoLite2 local)                        |
+| Erros             | `thiserror` (lib) + `color-eyre` (bin)              |
+| Testes            | `proptest` + `insta` (snapshots) + `wiremock`       |
+
+## Status
+
+- **F0** (concluída): fundação — workspace, core, traits, config, CLI skeleton.
+- **F1** (concluída): MVP nginx — source, heurísticas, scorer, pipeline, TUI.
+- **F2**: Cloudflare + IA local (ONNX).
+- **F3**: Multi-source (TCP, syslog) + LLM (OpenRouter).
+- **F4**: Dashboard web.

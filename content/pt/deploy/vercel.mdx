@@ -1,0 +1,51 @@
+---
+title: "Deploy da Documentação (Vercel)"
+description: "Deploy do site de docs na Vercel"
+---
+
+# Deploy da Documentação na Vercel
+
+A documentação do Sentry é um app **Fumadocs** (Next.js + MDX) separado do
+binário Rust, deployado na **Vercel** em **sentry.lucas-romero.com**.
+
+## Por que separado
+
+- O binário Rust é o produto; a docs é um site estático/SSR.
+- Fumadocs roda em Node.js (Next.js), não em Rust.
+- A Vercel oferece edge CDN, preview deployments e otimização automática
+  para Next.js.
+
+## Estrutura do app de docs
+
+```
+sentry-docs/
+├── content/pt/              # conteúdo MDX (PT-BR)
+├── src/
+│   ├── app/[lang]/docs/     # rotas de docs (i18n: pt, en)
+│   ├── components/          # Mermaid, mdx components
+│   └── lib/                 # source loader, i18n config
+├── source.config.ts         # config Fumadocs MDX
+├── next.config.mjs
+├── vercel.json
+└── package.json
+```
+
+## Deploy na Vercel
+
+1. Importe o repositório `sentry-docs` na Vercel.
+2. Framework preset: **Next.js**.
+3. Build command: `next build` (default).
+4. Output: `.next` (default).
+5. Variáveis de ambiente: nenhuma necessária (conteúdo é estático).
+6. Domínio custom: `sentry.lucas-romero.com`.
+
+## i18n
+
+O app suporta `pt` (default) e `en`. As rotas são `/<lang>/docs/...`.
+O conteúdo PT-BR vive em `content/pt/`.
+
+## Mermaid
+
+Os diagramas Mermaid são renderizados client-side via `mermaid.tsx`
+(component `<Mermaid chart={\`...\`} />`). O componente carrega `mermaid`
+dinamicamente (`await import('mermaid')`) para não inflar o bundle inicial.

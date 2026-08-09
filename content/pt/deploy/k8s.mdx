@@ -1,0 +1,66 @@
+---
+title: "Deploy em Kubernetes"
+description: "Manifests Kubernetes e kubectl"
+---
+
+# Deploy em Kubernetes
+
+O Sentry é distribuído com manifests Kubernetes em `deploy/k8s/` para deploy
+em clusters. Os manifests incluem Deployment, Service, ConfigMap e
+Secrets (segredos via env, não no ConfigMap).
+
+## Aplicar os manifests
+
+```bash
+kubectl apply -f deploy/k8s/
+```
+
+## Verificar o deploy
+
+```bash
+kubectl get pods -l app=sentry
+kubectl logs -f deployment/sentry
+kubectl describe pod -l app=sentry
+```
+
+## Segredos
+
+Segredos (tokens Cloudflare, LLM key, URL do Postgres) devem ir em Secrets,
+não ConfigMaps:
+
+```bash
+kubectl create secret generic sentry-secrets \
+    --from-literal=cf-token=$SENTRY_CF_TOKEN \
+    --from-literal=cf-zone=$SENTRY_CF_ZONE \
+    --from-literal=llm-key=$SENTRY_LLM_KEY \
+    --from-literal=pg-url=$SENTRY_STORAGE__POSTGRES__URL
+```
+
+Os manifests referenciam as secrets via `envFrom: secretRef:` ou
+`valueFrom: secretKeyRef:`.
+
+## Postgres
+
+Para produção, use um Postgres gerenciado (ex: Cloud SQL, RDS, ou um
+StatefulSet com PVC). Os manifests de exemplo assumem um Postgres externo
+configurável via `SENTRY_STORAGE__POSTGRES__URL`.
+
+## Escalar horizontalmente
+
+Como o estado (rules, ip_state) é compartilhado em Postgres, múltiplas
+réplicas do Sentry podem rodar em paralelo. Hot-reload de regras via
+`LISTEN/NOTIFY` funciona entre pods (todos escutam o mesmo canal
+`sentry_rules_changed`).
+
+```bash
+kubectl scale deployment/sentry --replicas=3
+```
+
+## Atualizar a configuração
+
+Edite o ConfigMap e reinicie o deployment:
+
+```bash
+kubectl edit configmap sentry-config
+kubectl rollout restart deployment/sentry
+```

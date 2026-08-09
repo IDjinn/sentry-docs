@@ -1,0 +1,51 @@
+---
+title: "Action Trait"
+description: "Action plugins — block, webhook, log"
+---
+
+# Action Trait
+
+Every action (block, challenge, webhook, log) is a plugin behind the `Action`
+trait. The decider invokes registered actions for an event when the verdict
+differs from `Allow`.
+
+```rust
+// sentry-core/src/action.rs
+#[async_trait]
+pub trait Action: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn execute(&self, evt: &Event, decision: &Decision) -> anyhow::Result<()>;
+}
+```
+
+## Implementations
+
+| Crate                          | Action                              | Status  |
+|--------------------------------|-------------------------------------|---------|
+| `sentry-action-cloudflare`     | Firewall rules, challenge           | Ready   |
+| `sentry-action-blocklist`      | Local state (for inline proxy)      | Ready   |
+| `sentry-action-webhook`        | Discord/Slack/Telegram/email        | Ready   |
+| `sentry-action-iptables`       | nftables/iptables (Linux)           | Future  |
+| `sentry-action-log`            | Record to DB                        | Ready   |
+
+## Type-safe via `ActionKind`
+
+The action type in config is the enum `sentry_core::config::ActionKind`
+(`Cloudflare` | `Challenge` | `Webhook` | `Blocklist` | `Log`), **not** a
+string. Typos in `type = "..."` in TOML fail at load time, not at runtime.
+
+## Edge vs non-edge actions
+
+- **Edge actions** (block/challenge/rate-limit at CDN/WAF): use the canonical
+  form `type = "challenge"` + `provider = "cloudflare"`. The alias
+  `type = "cloudflare"` (without `provider`) is equivalent and kept for
+  compatibility.
+- **Non-edge actions** (webhook, blocklist, log): a variant of `ActionKind`
+  and an arm in the `daemon::build_registry` match.
+
+## Daemon registration
+
+Actions are assembled in `daemon::build_registry` from config. Each
+`[[action]]` in `sentry.toml` becomes a match arm that instantiates the
+corresponding plugin. Adding a new non-edge action = adding a variant to
+`ActionKind` + a match arm.

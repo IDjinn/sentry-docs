@@ -1,0 +1,66 @@
+---
+title: "Shadow vs Enforce"
+description: "Pack execution modes and when to use each"
+---
+
+# Shadow vs Enforce
+
+Each default pack runs in one of three modes, controlled by
+`mode = "shadow" | "enforce" | "off"` per pack in `sentry.toml`.
+
+## Modes
+
+| Mode      | Behavior                                                              |
+|-----------|-----------------------------------------------------------------------|
+| `shadow`  | Only `Log` — records what *would* match, but takes no action. No traffic impact. |
+| `enforce` | Executes the action (`Block`, `Challenge`, `RateLimit`). Actually blocks/challenges. |
+| `off`     | Pack disabled — rules are not loaded.                                 |
+
+## When to use each
+
+### `shadow` (default for most packs)
+
+- **First deploy** — observe what the pack would detect before hardening.
+- **New traffic** — new app, new CDN, new source country.
+- **False-positive validation** — confirm zero FP before promoting.
+
+### `enforce`
+
+- **`sensitive_paths`** — ships in enforce from the start: access to
+  `.env`/`.git`/`.ssh` is statistically 100% malicious.
+- After a shadow period with zero false positives, promote the pack with:
+
+  ```bash
+  sentry rules packs enable vpn_proxy --mode enforce
+  ```
+
+### `off`
+
+- A pack that doesn't apply to your context (e.g. `country_blocklist` when
+  you serve globally).
+
+## Recommended rollout policy
+
+1. **Start everything in `shadow`** and observe the logs (or `sentry tail`).
+2. Check for false positives over a few days.
+3. Promote one pack at a time to `enforce`, starting with the most obvious
+   ones (`sensitive_paths`, `crawlers_bad`).
+4. Keep `crawlers_good` in `enforce` (allow) from the start if you care
+   about SEO.
+5. Use `sentry rules test <ip>` to simulate before promoting.
+
+## Exception: `sensitive_paths`
+
+`sensitive_paths` ships in `enforce` by default. Access to `.git/`, `.env`,
+`.ssh/` is statistically 100% malicious in web apps (there is no legitimate
+reason for a browser to access these). The cost of a false positive here is
+zero versus the risk of leaking credentials.
+
+## CLI
+
+```bash
+sentry rules packs list                          # shows packs and state
+sentry rules packs enable vpn_proxy --mode enforce
+sentry rules packs enable tor --mode shadow
+sentry rules packs disable crawlers_good
+```

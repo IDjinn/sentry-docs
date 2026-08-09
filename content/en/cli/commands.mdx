@@ -1,0 +1,108 @@
+---
+title: "Command Reference"
+description: "sentry CLI subcommands"
+---
+
+# Command Reference
+
+The CLI uses `clap` (derive) with subcommands. Real handlers in `cmd.rs`.
+
+## Monitor / daemon
+
+```bash
+sentry                          # starts the monitor (foreground daemon)
+sentry daemon start|stop|status # service mode (optional)
+sentry tail                     # live tail of events with colored risk
+sentry tail --only High,Critical
+sentry run                      # starts the daemon (alias)
+```
+
+## Incidents
+
+```bash
+sentry incidents list           # lists incidents
+sentry incidents show <id>
+```
+
+## IP
+
+```bash
+sentry ip info <ip>             # history, score, ASN, geo
+sentry ip block <ip> [--ttl 24h]
+sentry ip unblock <ip>
+```
+
+## Routes
+
+```bash
+sentry routes list              # known routes
+sentry routes learn             # baseline mode
+```
+
+## Reports
+
+```bash
+sentry report --from 24h        # aggregated report
+sentry report --export json|csv
+```
+
+## Config
+
+```bash
+sentry config validate
+sentry config show
+```
+
+## AI model
+
+```bash
+sentry model status             # model version, accuracy
+sentry model reload
+```
+
+## Tests and detection
+
+```bash
+sentry test detect "<payload>"  # runs the pipeline on an isolated string
+```
+
+## Cloudflare
+
+```bash
+sentry cloudflare status        # syncs state
+sentry cloudflare pull          # imports existing logs
+```
+
+## Rules engine
+
+```bash
+sentry rules list [--tag vpn] [--enabled] [--source db|config|feed]
+sentry rules show <id>
+sentry rules add --name "block admin from RU" \
+    --match 'country=RU AND path=/admin/*' --action block --priority 10
+sentry rules allow <ip> [--ttl 24h] [--note "monitoring agent"]
+sentry rules block <ip> [--ttl 24h] [--note "scan"]
+sentry rules allow-asn <asn> [--note "our DC"]
+sentry rules block-asn <asn>
+sentry rules enable <id>
+sentry rules disable <id>
+sentry rules delete <id>
+sentry rules import-feed spamhaus      # syncs reputation feed
+sentry rules packs list                # shows packs and state (shadow/enforce/off)
+sentry rules packs enable vpn_proxy --mode enforce
+sentry rules packs disable crawlers_good
+sentry rules test <ip>                 # simulates: which rules would match this IP now
+sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
+```
+
+## Sentry Auto
+
+```bash
+sentry auto                    # detects framework in cwd, generates sentry.auto.toml
+sentry auto --root /var/www    # specifies project root
+sentry auto --merge            # merge with existing sentry.toml
+sentry auto --dry-run          # only shows what it would detect, no write
+sentry auto --profile wordpress # force a profile (skip detection)
+sentry auto --deep             # AST scan of routes (slow, precise)
+sentry auto list-profiles      # lists supported profiles
+```

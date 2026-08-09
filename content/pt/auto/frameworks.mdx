@@ -1,0 +1,56 @@
+---
+title: "Perfis de Framework"
+description: "FrameworkProfile por stack"
+---
+
+# Perfis de Framework
+
+Cada perfil é um "preset" que conhece a estrutura do framework e gera regras
+específicas. Perfis são **plugins** (`sentry-profile-*`) que registram um
+detector e um gerador de regras.
+
+## Tabela de frameworks
+
+| Framework       | Detecção (sinais)                              | Regras geradas                                                            |
+|-----------------|------------------------------------------------|---------------------------------------------------------------------------|
+| **WordPress**   | `wp-config.php`, `wp-login.php`, `wp-admin/`   | Block `wp-login.php` brute-force rate-limit, allowlist `/wp-admin/admin-ajax.php`, protect `wp-content/uploads`, block `xmlrpc.php` abuse |
+| **Laravel**     | `artisan`, `composer.json` com `laravel/framework` | Protect `/.env`, block `storage/logs`, allowlist `/storage/app/public`, rate-limit `/login` |
+| **Next.js**     | `next.config.js`, `package.json` com `next`    | Allowlist `/_next/static/*` (CDN assets), protect `/api/admin/*`, block `/.next/` |
+| **Django**      | `manage.py`, `wsgi.py`, `settings.py`         | Protect `settings.py`, block `admin/` brute-force, allowlist `/static/` |
+| **Flask**       | `requirements.txt` com `flask`, `app.py`       | Detect rotas via `@app.route` (AST scan), proteger `/.env` |
+| **Rails**       | `Gemfile` com `rails`, `config/routes.rb`     | Parse `routes.rb` para rotas válidas, protect `/admin/*` |
+| **Express**     | `package.json` com `express`                   | Detect rotas via AST de `app.js`/`routes/` |
+| **ASP.NET**     | `*.csproj` com `Microsoft.AspNetCore`          | Protect `web.config`, allowlist `/wwwroot/*` |
+| **Nginx conf**  | `nginx.conf` ou `sites-enabled/*`              | Parse `location` blocks → rotas conhecidas exatas |
+| **Docker**      | `docker-compose.yml`, `Dockerfile`             | Detect portas expostas, serviços internos, gerar monitor de cada porta |
+
+## Detecção por arquivos-âncora
+
+| Arquivo-âncora        | Framework   |
+|-----------------------|-------------|
+| `wp-config.php`       | WordPress   |
+| `artisan`             | Laravel     |
+| `manage.py`           | Django      |
+| `app.py` + flask dep  | Flask       |
+| `config/routes.rb`    | Rails       |
+| `next.config.js`      | Next.js     |
+| `*.csproj` (AspNet)   | ASP.NET     |
+| `nginx.conf`          | Nginx       |
+| `Dockerfile`          | Docker      |
+
+## Manifestos
+
+| Manifesto              | Linguagem/Stack          |
+|------------------------|--------------------------|
+| `composer.json`        | PHP                      |
+| `package.json`         | Node                     |
+| `requirements.txt`     | Python                   |
+| `pyproject.toml`      | Python                   |
+| `Gemfile`              | Ruby                     |
+| `*.csproj`             | .NET                     |
+
+## Múltiplos frameworks
+
+Se o scanner detectar mais de um framework (ex: nginx + WordPress, ou
+Laravel + Docker), os perfis são **combinados** — rotas e regras de todos
+os perfis detectados são mescladas no `sentry.auto.toml`.

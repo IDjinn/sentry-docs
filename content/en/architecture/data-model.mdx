@@ -1,0 +1,135 @@
+---
+title: "Data Model"
+description: "Event, ProtocolData and protocol helpers"
+---
+
+# Data Model
+
+The `Event` is **modular by design**: fields common to any source live at
+the top level; protocol-specific fields live in `ProtocolData` (an extensible
+enum). Today `Http` covers nginx; tomorrow `Tcp`, `Udp`, `Tls` etc. can be
+added without changing the core — the source just populates the corresponding
+variant. Heuristics and the scorer operate on the `Event` and pattern-match
+on `protocol`, ignoring absent fields.
+
+```rust
+// sentry-core/src/event.rs
+pub struct Event {
+    // --- common to any protocol ---
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub source: SourceKind,          // Nginx, Tcp, HttpProxy, CloudflareLogs...
+    pub transport: Transport,        // Tcp | Udp | Tls | Internal
+    pub client_ip: IpAddr,
+    pub client_port: Option<u16>,
+    pub server_port: Option<u16>,    // exposed port observed
+    pub geo: Option<GeoInfo>,
+    pub asn: Option<u32>,
+    pub direction: Direction,        // Inbound | Outbound
+    pub bytes_in: Option<u64>,
+    pub bytes_out: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub raw: Option<String>,         // original record for audit
+
+    // --- protocol-specific ---
+    pub protocol: ProtocolData,
+}
+
+pub enum ProtocolData {
+    Http(HttpData),
+    Tcp(TcpData),
+    Udp(UdpData),
+    TlsHandshake(TlsData),
+    Raw(RawData),                    // fallback: bytes + note
+    // future variants land here without breaking consumers
+}
+
+pub struct HttpData {
+    pub method: HttpMethod,
+    pub scheme: Option<String>,      // http | https
+    pub host: Option<String>,
+    pub path: String,
+    pub query: Option<String>,
+    pub fragment: Option<String>,
+    pub status: Option<u16>,
+    pub user_agent: Option<String>,
+    pub referer: Option<String>,
+    pub headers: HashMap<String, String>,
+    pub body: Option<Vec<u8>>,       // when available (proxy/middleware)
+    pub cookies: Option<HashMap<String, String>>,
+}
+
+pub struct TcpData {
+    pub flags: TcpFlags,             // syn/fin/rst/ack...
+    pub payload: Option<Vec<u8>>,    // reconstructed stream bytes (when capturable)
+    pub stream_id: Option<u64>,      // to correlate segments
+    pub stage: TcpStage,             // Syn | SynAck | Data | Fin | Reset
+}
+
+pub struct UdpData {
+    pub payload: Option<Vec<u8>>,
+    pub dns_query: Option<String>,   // if recognized as DNS
+}
+
+pub struct TlsData {
+    pub sni: Option<String>,
+    pub ja3: Option<String>,         // TLS fingerprint
+    pub ja4: Option<String>,
+    pub cipher: Option<String>,
+    pub version: Option<String>,
+}
+
+pub struct RawData {
+    pub note: String,
+    pub bytes: Vec<u8>,
+}
+
+// Ergonomic helpers: e.kind_http() -> Option<&HttpData> etc.
+impl Event {
+    pub fn http(&self)  -> Option<&HttpData>  { match &self.protocol { ProtocolData::Http(d) => Some(d), _ => None } }
+    pub fn tcp(&self)   -> Option<&TcpData>   { match &self.protocol { ProtocolData::Tcp(d) => Some(d), _ => None } }
+    pub fn tls(&self)   -> Option<&TlsData>   { match &self.protocol { ProtocolData::TlsHandshake(d) => Some(d), _ => None } }
+    pub fn is_http(&self) -> bool { matches!(self.protocol, ProtocolData::Http(_)) }
+}
+```
+
+> **Rule**: no pipeline stage may assume `ProtocolData::Http`. HTTP heuristics
+> check `evt.http()` and return `None` for other variants; TCP heuristics do
+> the analog. This way the same pipeline runs for nginx today and TCP capture
+> tomorrow.
+
+## AnalysisResult
+
+```rust
+pub struct AnalysisResult {
+    pub risk_score: u8,               // 0..=100
+    pub risk_level: RiskLevel,        // Info|Low|Medium|High|Critical
+    pub signals: Vec<Signal>,         // what fired
+    pub verdict: Verdict,             // Allow|Challenge|Block|Quarantine
+}
+
+pub enum Signal {
+    PathTraversal, SqlInjection, Xss, CmdInjection,
+    UnknownRoute, ScanBehavior, AbnormalRate,
+    SuspiciousUA, TorExitNode, KnownBadIp,
+    AnomalousPayload(/* model */),
+    Custom(String),
+}
+```
+
+## Adding a new protocol
+
+When adding a new protocol:
+
+1. Add a variant to `ProtocolData`.
+2. Add a helper on `impl Event` (e.g. `pub fn my_proto(&self) -> Option<&MyData>`).
+3. Update `protocol_kind()`.
+4. **Do not** add loose fields to the top-level `Event` — put them in the enum.
+
+## Encoding normalization (heuristics)
+
+Heuristics (SQLi, XSS, path traversal, etc.) run on the **URL-decoded** form
+of the path/query (`heuristics::http_text`), so that encoded payloads
+(`%27` = `'`, `+` or `%20` = space) cannot bypass them. When writing new
+heuristics, always use `http_text(http)` instead of reading `http.path` /
+`http.query` directly.
