@@ -78,5 +78,8 @@ flowchart LR
 - Tokens via env (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
 - Local cache of already-challenged IPs (configurable TTL) to avoid hammering the API.
 - Modes: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
-- **Important**: in phase 1 Sentry is **read-only + Cloudflare action**. There
-  is no inline proxy. Inline is a future phase (`sentry-proxy`).
+- **Default is passive mode**: read-only sources + Cloudflare action. For
+  real inline enforcement, `[deployment] mode = "inline"` runs the
+  `sentry-edge` reverse proxy in front of your app (verdicts applied before
+  proxying), and blocked IPs are enforced by a fast-path before the
+  pipeline — see the deployment modes section of the architecture docs.

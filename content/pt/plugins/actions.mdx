@@ -23,7 +23,7 @@ pub trait Action: Send + Sync {
 | Crate                          | Ação                          | Status  |
 |--------------------------------|-------------------------------|---------|
 | `sentry-action-cloudflare`     | Regras de firewall, challenge | Pronto  |
-| `sentry-action-blocklist`      | Estado local (para inline proxy) | Pronto  |
+| `sentry-action-blocklist`      | Alimenta a block table compartilhada; a edge inline nega IPs bloqueados antes do pipeline | Pronto  |
 | `sentry-action-webhook`        | Discord/Slack/Telegram/email  | Pronto  |
 | `sentry-action-iptables`       | nftables/iptables (Linux)     | Futuro  |
 | `sentry-action-log`            | Registrar em DB               | Pronto  |
