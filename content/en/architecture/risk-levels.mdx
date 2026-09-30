@@ -34,8 +34,31 @@ threshold.
 | Empty/suspicious user-agent         | 10     | yes          |
 | Tor exit node                       | 15     | —            |
 | IP in reputation feed               | 50     | —            |
+| Promiscuous scanner (`promiscuous` feed) | 10 | —            |
+| Scan→attack cross-IP (`[correlation]`)   | 20 | yes          |
 | ONNX anomaly > 0.8                  | 50     | no           |
 | Access to sensitive path           | 30     | yes          |
 
 Weights combine (sum capped at 100), with a bonus for repetition within a
 window. **Everything is configurable.**
+
+## Cross-IP scan→attack correlation (F3.10)
+
+The honeypot "shot calling" pattern: a scan (404 sweep, masscan/zmap SYN, …)
+from a "clean" IP followed by an exploit/brute-force from a **different** IP
+in the same /24 (IPv4), /64 (IPv6) or ASN within the window emits
+`ScanAttackCorrelation` (weight 20) — an aggravator on top of the attack,
+never a detector by itself. SYNs captured by the `tcp` source feed the same
+window as HTTP 404 sweeps.
+
+```toml
+[correlation]
+enabled = true
+window_secs = 900           # 15 min
+```
+
+Alongside it comes the scanner taxonomy as reputation tiers: `authorized`
+(contracted scanner — no signal; trust them with
+`reputation=authorized` → allow) and `promiscuous` (publishes recon data
+anyone can query → `PromiscuousScanner`, weight 10 — a scanner that
+publishes recon for anyone is not benign).
