@@ -6,8 +6,8 @@ description: "Optional remote classification, provider-agnostic via the LlmProvi
 # LLM Provider
 
 The LLM is the **optional**, highest-cost layer: it runs as a
-[fork](./index#modes-fork--inline--shadow) for events the hot path and the
-[local model](./onnx) could not settle — score ≥ `only_above` (30) or a
+[fork](/en/docs/ai#modes-fork--inline--shadow) for events the hot path and the
+[local model](/en/docs/ai/onnx) could not settle — score ≥ `only_above` (30) or a
 Quarantine verdict. The core never calls an LLM API directly: everything
 goes through the [`LlmProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L95)
 trait, and selection happens by config. The default is off

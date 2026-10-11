@@ -101,7 +101,7 @@ connection. The BlockTable fast-path denies before the handshake.
 
 - ALPN `h2` + `http/1.1` with HTTP/2 served on the same router
   (`[edge] http2`, default true); metric `sentry_edge_tls_alpn_total{alpn}`.
-- `tls_allowed_hosts` — a missing/unknown SNI (the 443 honeypot) becomes
+- `tls_allowed_hosts` — a missing/unknown SNI (the exposed 443 listener) becomes
   the `TlsSniMismatch` signal (weight 20); a post-handshake
   Block/Quarantine drops the connection.
 - `tls_redirect_https` answers 301 on port 80 **after** the pipeline —

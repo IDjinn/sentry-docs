@@ -1,13 +1,12 @@
 ---
 title: "Examples"
-description: "Real incident reports captured by a production Sentry honeypot deployment"
+description: "Real incident reports captured by a production Sentry deployment"
 ---
 
 # Examples
 
 The reports in this section are **real captures** from a production Sentry
-deployment operating as a **honeypot** — a target deliberately exposed to
-the internet. Each page is a post-incident report: what attacked, how the
+deployment — a target deliberately exposed to the internet. Each page is a post-incident report: what attacked, how the
 pipeline detected it, which verdict was enforced, and what forensics
 confirmed afterwards. Attacker IPs are partially masked, exactly as
 published.
@@ -21,10 +20,10 @@ weights and metrics are reproduced exactly as captured.
 
 | Report | Scenario | What it demonstrates |
 | --- | --- | --- |
-| [Mozi: RCE attempt](./mozi-rce) | Mozi worm tries a NetGear router command injection (`setup.cgi?todo=syscmd`) | `CmdInjection` heuristic + inline edge block (403) + 24h blocklist ban (`ip_state`) + automatic incident + clean forensics |
-| [Mozi worm propagation](./mozi-propagation) | The same worm returns from a different infected host, download URL pointing at the attacker's own IP | Host-to-host worm propagation (C2 embedded in the payload), layered TCP + HTTP telemetry, identical detection across independent infections |
-| [Distributed MCP/SSE scanner](./mcp-scanner) | 25 IPs probe AI infrastructure (MCP/SSE), one probe per IP to dodge per-IP rate limits | `bad_crawler` rule pack (curated User-Agent dataset) on the reputation fast path: 25/25 scored 100, blocked and banned |
-| [RCE via upload form field](./upload-field-rce) | Command injection hidden inside a multipart form field's content | Request-body inspection (F10): multipart parser + `upload_content` heuristic, with zero body bytes persisted |
+| [Mozi: RCE attempt](/en/docs/examples/mozi-rce) | Mozi worm tries a NetGear router command injection (`setup.cgi?todo=syscmd`) | `CmdInjection` heuristic + inline edge block (403) + 24h blocklist ban (`ip_state`) + automatic incident + clean forensics |
+| [Mozi worm propagation](/en/docs/examples/mozi-propagation) | The same worm returns from a different infected host, download URL pointing at the attacker's own IP | Host-to-host worm propagation (C2 embedded in the payload), layered TCP + HTTP telemetry, identical detection across independent infections |
+| [Distributed MCP/SSE scanner](/en/docs/examples/mcp-scanner) | 25 IPs probe AI infrastructure (MCP/SSE), one probe per IP to dodge per-IP rate limits | `bad_crawler` rule pack (curated User-Agent dataset) on the reputation fast path: 25/25 scored 100, blocked and banned |
+| [RCE via upload form field](/en/docs/examples/upload-field-rce) | Command injection hidden inside a multipart form field's content | Request-body inspection (F10): multipart parser + `upload_content` heuristic, with zero body bytes persisted |
 
 ## Original files
 
@@ -39,5 +38,5 @@ of the main repository:
 
 ## Related reading
 
-- [Rules Engine](../rules) — rule packs, reputation fast path and DSL
-- [Architecture](../architecture) — request flow and risk levels
+- [Rules Engine](/en/docs/rules) — rule packs, reputation fast path and DSL
+- [Architecture](/en/docs/architecture) — request flow and risk levels

@@ -15,19 +15,19 @@ description: "Real-time access monitor and inline edge WAF with AI-powered threa
 - **Layered detection**: deterministic rules engine (DSL + packs) → URL-decoding heuristics → local ONNX AI → optional LLM (OpenRouter/Ollama), with repeat-offender escalation and cross-IP scan→attack correlation.
 - **Action at every layer**: Cloudflare (block/challenge/rate-limit, IPv6 /64), kernel bans (nftables/ipset/firewalld), OPNsense/pfSense, nginx deny + challenge, signed webhooks, community reporting (AbuseIPDB).
 - **Operable**: web dashboard with Argon2id auth + RBAC, ratatui TUI, Prometheus metrics + Grafana, SIEM export (CEF/LEEF/syslog), OS service mode.
-- **Honeypot hardening**: `[real_ip]` with trusted proxies, rDNS bot verification, DB-backed datasets with hot-reload, header posture (advisory).
+- **Exposure hardening**: `[real_ip]` with trusted proxies, rDNS bot verification, DB-backed datasets with hot-reload, header posture (advisory).
 - **Fast**: ~4.36 µs/event pipeline (~800× faster than v1), two action lanes and tiered degradation under overload — detection and containment never degrade.
 
 ## Documentation
 
-- [Overview](./overview) — goals, non-goals, stack and status (F0–F12 concluded).
-- [Quickstart](./quickstart) — Docker, local build, basic configuration.
-- [Architecture](./architecture) — pipeline, data model, request flow.
-- [Rules Engine](./rules) — deterministic rules, DSL, packs, datasets.
-- [Plugins](./plugins) — `Source` and `Action` traits, challenge providers.
-- [AI](./ai) — heuristics, local ONNX, optional LLM.
-- [CLI & TUI](./cli) — command reference and interactive interface.
-- [Configuration](./config) — `sentry.toml` reference.
-- [Reference](./reference) — crates, modules and types with source links.
-- [Examples](./examples) — example configs by scenario.
-- [Deploy](./deploy) — Docker, Kubernetes, Vercel.
+- [Overview](/en/docs/overview) — goals, non-goals, stack and status (F0–F12 concluded).
+- [Quickstart](/en/docs/quickstart) — Docker, local build, basic configuration.
+- [Architecture](/en/docs/architecture) — pipeline, data model, request flow.
+- [Rules Engine](/en/docs/rules) — deterministic rules, DSL, packs, datasets.
+- [Plugins](/en/docs/plugins/sources) — `Source` and `Action` traits, challenge providers.
+- [AI](/en/docs/ai) — heuristics, local ONNX, optional LLM.
+- [CLI & TUI](/en/docs/cli/commands) — command reference and interactive interface.
+- [Configuration](/en/docs/config/sentry-toml) — `sentry.toml` reference.
+- [Reference](/en/docs/reference) — crates, modules and types with source links.
+- [Examples](/en/docs/examples) — example configs by scenario.
+- [Deploy](/en/docs/deploy/docker) — Docker e Kubernetes.

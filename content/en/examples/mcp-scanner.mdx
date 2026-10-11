@@ -3,14 +3,14 @@ title: "Distributed MCP/SSE scanner"
 description: "25 IPs probe MCP/SSE endpoints over 3 days; the bad_crawler pack scored 25/25 at 100/100, blocked and banned them all"
 ---
 
-# Incident Report — Distributed MCP/SSE Endpoint Scanner (Honeypot Capture)
+# Incident Report — Distributed MCP/SSE Endpoint Scanner (Production Capture)
 
 > **Original source:**
 > [`incident-report-mcp-scanner.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mcp-scanner.md)
 > in the repository.
 
-Companion to [Mozi: RCE attempt](./mozi-rce). Real capture from a
-production Sentry honeypot deployment; attacker IPs are partially masked.
+Companion to [Mozi: RCE attempt](/en/docs/examples/mozi-rce). Real capture from a
+production Sentry deployment; attacker IPs are partially masked.
 
 ## TL;DR
 
@@ -60,7 +60,7 @@ No heuristics, no scoring model, no LLM — the **`bad_crawler` rule pack**
 (a curated scanner/bad-bot User-Agent dataset) matched on the first byte of
 the first request:
 
-```
+```text
 signal: rule_hit / bad_crawler — weight 100 → score 100 → critical → block
 ```
 
@@ -77,4 +77,4 @@ heuristics or AI.
   when the rule pack was curated; the dataset still caught the campaign
   because scanner tooling reuses identifiable User-Agents.
 - **Zero-cost containment.** 25 blocks, 25 bans, no operator action, no
-  backend exposure — the honeypot surface never answered a single probe.
+  backend exposure — the exposed surface never answered a single probe.

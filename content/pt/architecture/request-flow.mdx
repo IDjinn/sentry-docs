@@ -61,7 +61,7 @@ flowchart TD
 4. **Rules engine** ([`rules.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs), [`packs.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs)) —
    fast path. Precedência: `Allow` (bypass total) > `Block`/`Challenge`/
    `RateLimit` (short-circuit) > `Log`/`Tag` (anota e continua). Packs
-   default: `sensitive_paths`, `honeypot_paths`, `crawlers_bad`,
+   default: `sensitive_paths`, `crawlers_bad`,
    `crawlers_good`, `empty_ua`, `http_anomaly`, `vpn_proxy`, `tor`,
    `rate_scan`, `country_blocklist`, `host_allowlist`.
 5. **Heurísticas** ([`heuristics.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs)) —

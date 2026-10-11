@@ -14,7 +14,7 @@ docker compose -f deploy/docker/docker-compose.yml up -d
 The compose file builds the image and brings up two services: `sentry`
 (daemon + Postgres configured via env) and `postgres` (the
 events/incidents/rules database). Full details in
-[Deploy with Docker](./deploy/docker).
+[Deploy with Docker](/en/docs/deploy/docker).
 
 Secrets go in environment variables, never in the config:
 
@@ -81,7 +81,7 @@ type = "log"
 
 The verdict mapping is configurable in `[policy]` (default: Info/Low → allow,
 Medium → rate_limit, High → challenge, Critical → block). The complete
-reference for every section lives in [Configuration](./config).
+reference for every section lives in [Configuration](/en/docs/config/sentry-toml).
 
 ## Running the monitor
 
@@ -111,7 +111,7 @@ Default packs
 ([`packs.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs)):
 `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`, `sensitive_paths`,
 `empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist`,
-`honeypot_paths`, `host_allowlist`. Each pack runs in `shadow` (log only),
+`host_allowlist`. Each pack runs in `shadow` (log only),
 `enforce` (act) or `off` — `sensitive_paths`, `crawlers_bad` and
 `crawlers_good` ship in `enforce`; the rest in `shadow` or `off`.
 
@@ -125,9 +125,9 @@ Postgres, hot-reloaded by running daemons).
 
 ## Next steps
 
-- [Rules Engine](./rules) — DSL, packs and datasets.
-- [Plugins](./plugins) — sources, actions and challenge providers.
-- [AI](./ai) — heuristics, local ONNX, optional LLM.
-- [CLI](./cli) — full command reference.
-- [Configuration](./config) — `sentry.toml` reference.
-- [Deploy](./deploy) — Docker, Kubernetes, Vercel.
+- [Rules Engine](/en/docs/rules) — DSL, packs and datasets.
+- [Plugins](/en/docs/plugins/sources) — sources, actions and challenge providers.
+- [AI](/en/docs/ai) — heuristics, local ONNX, optional LLM.
+- [CLI](/en/docs/cli/commands) — full command reference.
+- [Configuration](/en/docs/config/sentry-toml) — `sentry.toml` reference.
+- [Deploy](/en/docs/deploy/docker) — Docker e Kubernetes.

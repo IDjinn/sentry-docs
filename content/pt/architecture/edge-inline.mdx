@@ -98,7 +98,7 @@ conexão. O fast-path do BlockTable nega antes do handshake.
 
 - ALPN `h2` + `http/1.1` com HTTP/2 servido no mesmo router
   (`[edge] http2`, default true); métrica `sentry_edge_tls_alpn_total{alpn}`.
-- `tls_allowed_hosts` — SNI ausente/desconhecido (honeypot 443) vira o
+- `tls_allowed_hosts` — SNI ausente/desconhecido (443 exposto) vira o
   sinal `TlsSniMismatch` (peso 20); Block/Quarantine pós-handshake derrubam
   a conexão.
 - `tls_redirect_https` responde 301 na porta 80 **depois** do pipeline —

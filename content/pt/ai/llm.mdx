@@ -6,8 +6,8 @@ description: "Classificação remota opcional, provider-agnostic via trait LlmPr
 # LLM Provider
 
 O LLM é a camada **opcional** de maior custo: roda como
-[fork](./index#modos-fork--inline--shadow) para eventos que o hot path e o
-[modelo local](./onnx) não resolveram — score ≥ `only_above` (30) ou verdict
+[fork](/pt/docs/ai#modos-fork--inline--shadow) para eventos que o hot path e o
+[modelo local](/pt/docs/ai/onnx) não resolveram — score ≥ `only_above` (30) ou verdict
 Quarantine. O core nunca chama uma API de LLM diretamente: tudo passa pela
 trait [`LlmProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L95),
 e a seleção acontece por config. Default é desligado

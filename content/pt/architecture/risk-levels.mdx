@@ -114,7 +114,7 @@ TTL de 24 h das regras de edge). A escalada **só eleva** verdict:
 
 ## Correlação scan→ataque cross-IP (F3.10)
 
-Padrão "shot calling" observado em honeypots: um scan (sweep 404, SYN de
+Padrão "shot calling" observado entre nós que observam a mesma superfície: um scan (sweep 404, SYN de
 masscan/zmap, …) de um IP "limpo" seguido de um exploit/brute-force de
 **outro** IP do mesmo /24 (IPv4), /64 (IPv6) ou ASN dentro da janela emite
 `ScanAttackCorrelation` (peso 20) — um agravador do ataque, nunca um

@@ -208,7 +208,7 @@ Packs padrão do motor de regras.
 | `mode` | string | `shadow` | `shadow` (só anota/loga) \| `enforce` (age) \| `off`. |
 | `params` | tabela | `{}` | Parâmetros extras do pack (ex.: `countries`, `domains`), achatados como `<pack>__<param>`. |
 
-Packs disponíveis: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good` (divide-se em `crawlers_good_verified` / `crawlers_good_unverified_ok` com o bot verification ativo), `sensitive_paths` (único em `enforce` por padrão), `empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist` (`params.countries`), `honeypot_paths` e `host_allowlist` (`params.domains`).
+Packs disponíveis: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good` (divide-se em `crawlers_good_verified` / `crawlers_good_unverified_ok` com o bot verification ativo), `sensitive_paths` (único em `enforce` por padrão), `empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist` (`params.countries`) e `host_allowlist` (`params.domains`).
 
 ```toml
 [[rules.pack]]
@@ -343,7 +343,7 @@ Detecção comportamental de ataques de autenticação e diretório por janela d
 
 ## [`[correlation]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L548)
 
-Correlação scan→ataque cross-IP ("honeypot shot calling"): um ataque do IP B correlaciona com um scan de um IP **diferente** no mesmo /24 (IPv4), /64 (IPv6) ou ASN observado na janela → sinal `ScanAttackCorrelation` em B.
+Correlação scan→ataque cross-IP ("shot calling" entre nós observando a mesma superfície): um ataque do IP B correlaciona com um scan de um IP **diferente** no mesmo /24 (IPv4), /64 (IPv6) ou ASN observado na janela → sinal `ScanAttackCorrelation` em B.
 
 | Campo | Tipo | Padrão | Descrição |
 | --- | --- | --- | --- |

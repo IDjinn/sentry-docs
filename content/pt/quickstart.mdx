@@ -13,7 +13,7 @@ docker compose -f deploy/docker/docker-compose.yml up -d
 
 O compose faz o build da imagem e sobe dois serviços: `sentry` (daemon +
 Postgres configurado via env) e `postgres` (banco de eventos/incidentes/regras).
-Detalhes completos em [Deploy com Docker](./deploy/docker).
+Detalhes completos em [Deploy com Docker](/pt/docs/deploy/docker).
 
 Segredos vão em variáveis de ambiente, nunca no config:
 
@@ -78,7 +78,7 @@ type = "log"
 
 O mapeamento de veredito é configurável em `[policy]` (default: Info/Low →
 allow, Medium → rate_limit, High → challenge, Critical → block). Referência
-completa de todas as seções em [Configuração](./config).
+completa de todas as seções em [Configuração](/pt/docs/config/sentry-toml).
 
 ## Rodando o monitor
 
@@ -104,7 +104,7 @@ precedência: `Allow` (bypass total) > `Block`/`Challenge`/`RateLimit`
 
 Packs default ([`packs.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs)):
 `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`, `sensitive_paths`,
-`empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist`, `honeypot_paths`,
+`empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist`,
 `host_allowlist`. Cada pack roda em `shadow` (log only), `enforce` (age) ou
 `off` — `sensitive_paths`, `crawlers_bad` e `crawlers_good` já vêm em
 `enforce`; os demais em `shadow` ou `off`.
@@ -119,9 +119,9 @@ Postgres, hot-reload nos daemons vivos).
 
 ## Próximos passos
 
-- [Rules Engine](./rules) — DSL, packs e datasets.
-- [Plugins](./plugins) — sources, actions e challenge providers.
-- [IA](./ai) — heurísticas, ONNX local, LLM opcional.
-- [CLI](./cli) — referência completa de comandos.
-- [Configuração](./config) — referência do `sentry.toml`.
-- [Deploy](./deploy) — Docker, Kubernetes, Vercel.
+- [Rules Engine](/pt/docs/rules) — DSL, packs e datasets.
+- [Plugins](/pt/docs/plugins/sources) — sources, actions e challenge providers.
+- [IA](/pt/docs/ai) — heurísticas, ONNX local, LLM opcional.
+- [CLI](/pt/docs/cli/commands) — referência completa de comandos.
+- [Configuração](/pt/docs/config/sentry-toml) — referência do `sentry.toml`.
+- [Deploy](/pt/docs/deploy/docker) — Docker e Kubernetes.

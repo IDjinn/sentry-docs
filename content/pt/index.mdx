@@ -15,19 +15,19 @@ O **Sentry** é um monitor de acessos e **WAF de edge inline** em tempo real par
 - **Detecção em camadas**: rules engine determinístico (DSL + packs) → heurísticas com URL-decode → IA local ONNX → LLM opcional (OpenRouter/Ollama), com escalonamento de reincidentes e correlação scan→ataque cross-IP.
 - **Ação em toda a pilha**: Cloudflare (block/challenge/rate-limit, IPv6 /64), bans de kernel (nftables/ipset/firewalld), OPNsense/pfSense, nginx deny + challenge, webhooks assinados, report comunitário (AbuseIPDB).
 - **Operável**: dashboard web com auth Argon2id + RBAC, TUI ratatui, métricas Prometheus + Grafana, export SIEM (CEF/LEEF/syslog), modo serviço no OS.
-- **Hardening de honeypot**: `[real_ip]` com trusted proxies, verificação de bots por rDNS, datasets DB-backed com hot-reload, postura de headers (advisory).
+- **Hardening de exposição**: `[real_ip]` com trusted proxies, verificação de bots por rDNS, datasets DB-backed com hot-reload, postura de headers (advisory).
 - **Rápido**: pipeline em ~4,36 µs/evento (~800× mais rápido que a v1), duas lanes de actions e degradação em tiers sob overload — detecção e contenção nunca degradam.
 
 ## Documentação
 
-- [Visão geral](./overview) — objetivos, não-objetivos, stack e status (F0–F12 concluídas).
-- [Início rápido](./quickstart) — Docker, build local, configuração básica.
-- [Arquitetura](./architecture) — pipeline, modelo de dados, fluxo de requisição.
-- [Rules Engine](./rules) — regras determinísticas, DSL, packs, datasets.
-- [Plugins](./plugins) — traits `Source` e `Action`, challenge providers.
-- [IA](./ai) — heurísticas, ONNX local, LLM opcional.
-- [CLI & TUI](./cli) — referência de comandos e interface interativa.
-- [Configuração](./config) — referência do `sentry.toml`.
-- [Referência](./reference) — crates, módulos e tipos com links para o source.
-- [Exemplos](./examples) — configs de exemplo por cenário.
-- [Deploy](./deploy) — Docker, Kubernetes, Vercel.
+- [Visão geral](/pt/docs/overview) — objetivos, não-objetivos, stack e status (F0–F12 concluídas).
+- [Início rápido](/pt/docs/quickstart) — Docker, build local, configuração básica.
+- [Arquitetura](/pt/docs/architecture) — pipeline, modelo de dados, fluxo de requisição.
+- [Rules Engine](/pt/docs/rules) — regras determinísticas, DSL, packs, datasets.
+- [Plugins](/pt/docs/plugins/sources) — traits `Source` e `Action`, challenge providers.
+- [IA](/pt/docs/ai) — heurísticas, ONNX local, LLM opcional.
+- [CLI & TUI](/pt/docs/cli/commands) — referência de comandos e interface interativa.
+- [Configuração](/pt/docs/config/sentry-toml) — referência do `sentry.toml`.
+- [Referência](/pt/docs/reference) — crates, módulos e tipos com links para o source.
+- [Exemplos](/pt/docs/examples) — configs de exemplo por cenário.
+- [Deploy](/pt/docs/deploy/docker) — Docker e Kubernetes.

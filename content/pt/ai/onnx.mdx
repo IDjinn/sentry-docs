@@ -6,7 +6,7 @@ description: "ThreatModel clássico (features → sklearn → ONNX) via ort, com
 # Modelo ONNX Local
 
 O modelo local do Sentry é um classificador ML clássico (regressão logística)
-que roda como [fork assíncrono](./index) ao lado do hot path. Inferência é
+que roda como [fork assíncrono](/pt/docs/ai) ao lado do hot path. Inferência é
 local — sem rede, determinística, tipicamente sub-ms — via `ort` (ONNX
 Runtime), atrás da feature Cargo `onnx` (opcional, desligada por default).
 
@@ -121,4 +121,4 @@ cache_ttl_secs = 300        # cache de resultados por hash do payload
 
 Chaves e defaults em [`AiConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1207).
 O que `mode`/`trigger`/cache fazem em runtime está descrito em
-[Camada de IA](./index#modos-fork--inline--shadow).
+[Camada de IA](/pt/docs/ai#modos-fork--inline--shadow).

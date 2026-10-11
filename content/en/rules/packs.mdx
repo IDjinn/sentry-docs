@@ -20,7 +20,6 @@ default modes come from
 | Pack                | Default     | In `shadow` | In `enforce` | Priority | Params                          |
 |---------------------|-------------|-------------|--------------|----------|---------------------------------|
 | `sensitive_paths`   | **enforce** | `Log`       | `Block`      | 5        | —                               |
-| `honeypot_paths`    | shadow      | `Log`       | `Block`      | 8        | —                               |
 | `host_allowlist`    | off         | `Log`       | `Block`      | 8        | `domains`                       |
 | `crawlers_bad`      | shadow      | `Log`       | `Block`      | 10       | —                               |
 | `country_blocklist` | off         | `Log`       | `Block`      | 10       | `countries`                     |
@@ -78,22 +77,6 @@ responsible-disclosure document is never blocked.
 [[rules.pack]]
 name = "sensitive_paths"
 mode = "enforce"   # default — drop to "shadow" if your site really serves these paths
-```
-
-## `honeypot_paths` (default: shadow)
-
-Broad bait in the style of
-[nginx-honeypot](https://github.com/dvershinin/nginx-honeypot)
-([`HONEYPOT_PATHS`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/lists.rs#L118)):
-any `.aspx`, `cgi-bin`, `node_modules`, `/actuator/health` and any dotfile
-path (`^/\.`). On a real site they are too generic to block; on a decoy,
-any hit is suspicious. The pack is rules-only: it is not part of the
-heuristic prefilter.
-
-```toml
-[[rules.pack]]
-name = "honeypot_paths"
-mode = "shadow"
 ```
 
 ## `host_allowlist` (default: off)

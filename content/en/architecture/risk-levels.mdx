@@ -117,7 +117,7 @@ edge-rule TTL). Escalation **only raises** the verdict:
 
 ## Cross-IP scan→attack correlation (F3.10)
 
-The "shot calling" pattern observed in honeypots: a scan (404 sweep,
+The "shot calling" pattern observed between nodes watching the same surface: a scan (404 sweep,
 masscan/zmap SYNs, …) from a "clean" IP followed by an exploit/brute-force
 from **another** IP in the same /24 (IPv4), /64 (IPv6) or ASN within the
 window emits `ScanAttackCorrelation` (weight 20) — an aggravator of the
