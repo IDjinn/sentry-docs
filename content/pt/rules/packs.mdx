@@ -1,169 +1,265 @@
 ---
 title: "Default Rule Packs"
-description: "Packs pré-configurados que acompanham o Sentry"
+description: "Catálogo atual dos packs pré-configurados que acompanham o Sentry"
 ---
 
 # Default Rule Packs
 
-Packs shipados com o Sentry, ativáveis com uma linha. Cada pack é um conjunto
-de regras com `tags` para fácil inspeção/edição via CLI.
+Packs são conjuntos de regras pré-construídas em
+[`crates/sentry-core/src/packs.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs)
+que entram no ruleset no startup. Cada pack tem um modo
+[`PackMode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L10):
+`shadow` (só registra), `enforce` (age) ou `off` (regras não carregam). A
+lista canônica é
+[`all_pack_names`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L35);
+modos default vêm de
+[`build_default_ruleset_with`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L61).
 
-| Pack                | Default       | O que faz                                                                  |
-|---------------------|---------------|----------------------------------------------------------------------------|
-| `vpn_proxy`         | on            | Block/Challenge IPs classificados como VPN/proxy (reputation = Vpn/Proxy)  |
-| `tor`               | on            | Block exit nodes Tor (reputation = Tor)                                     |
-| `datacenter_abuse`  | on            | Challenge ASNs de datacenter fora de allowlist (DigitalOcean, OVH, Hetzner, etc. — alvos de bots) |
-| `crawlers_bad`      | on            | Block UAs de scanners/ferramentas de ataque: `sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, `curl/8.*` suspeito, `python-requests` sem contexto |
-| `crawlers_good`     | off           | **Allow** bots legítimos (Googlebot, Bingbot, etc.) — verificação via reverse-DNS conforme spec do Google |
-| `empty_ua`          | on            | Challenge/block requisições sem User-Agent (raro em tráfego legítimo)       |
-| `sensitive_paths`   | on (enforce)  | **Block** hits em arquivos/dirs sensíveis por default (ver lista completa abaixo) |
-| `country_blocklist` | off           | Block países não atendidos (configura lista ISO)                           |
-| `country_allowlist` | off           | Allow só países da lista (mais restritivo, modo opt-in)                    |
-| `http_anomaly`      | on            | Block métodos raros não usados (`TRACE`, `CONNECT`), HTTP/0.9, headers malformados |
-| `rate_scan`        | on            | Rate-limit/Block IP com >N 404 em janela (directory brute-force)            |
+## Visão geral
 
-**Semântica de default `on`**: packs vêm ativos mas em modo `Log` ou
-`Challenge` (não `Block` direto) no primeiro deploy — modo *shadow* para
-validar antes de endurecer. Usuário promove para `Block` após confirmar zero
-falso-positivo. Controlado por `mode = "shadow" | "enforce"` por pack.
-**Exceção**: `sensitive_paths` já vem em `enforce` por default (acesso a
-`.env`/`.git` é sempre malicioso).
+| Pack                | Default    | Em `shadow` | Em `enforce` | Prioridade | Params                          |
+|---------------------|------------|-------------|--------------|------------|---------------------------------|
+| `sensitive_paths`   | **enforce**| `Log`       | `Block`      | 5          | —                               |
+| `honeypot_paths`    | shadow     | `Log`       | `Block`      | 8          | —                               |
+| `host_allowlist`    | off        | `Log`       | `Block`      | 8          | `domains`                       |
+| `crawlers_bad`      | shadow     | `Log`       | `Block`      | 10         | —                               |
+| `country_blocklist` | off        | `Log`       | `Block`      | 10         | `countries`                     |
+| `http_anomaly`      | shadow     | `Log`       | `Block`      | 12         | —                               |
+| `empty_ua`          | shadow     | `Log`       | `Challenge`  | 15         | —                               |
+| `rate_scan`         | shadow     | `Log`       | `RateLimit`  | 15         | —                               |
+| `vpn_proxy`         | shadow     | `Log`       | `Challenge`  | 20         | —                               |
+| `tor`               | shadow     | `Log`       | `Block`      | 20         | —                               |
+| `crawlers_good`     | off        | `Allow`     | `Allow`      | 2–3        | —                               |
 
-## Pack `sensitive_paths` — lista completa (default enforce)
+Observações:
 
-Arquivos e diretórios cujo acesso é **sempre bloqueado** por default.
-Cobertura dividida em categorias; cada entrada é uma regra `path regex` →
-`Block`. A lista é extensível via config/DB.
+- `sensitive_paths` é o **único pack que já vem em `enforce`** — acesso a
+  `.env`/`.git`/`.ssh` é estatisticamente sempre malicioso.
+- `crawlers_good` gera regras `Allow` **em qualquer modo ativo** (o modo só
+  liga/desliga o pack); ele vem **off** por default.
+- Strings de modo desconhecidas viram `off`
+  ([`PackMode::parse`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L19)).
+- `sentry rules packs` lista o estado atual de todos os packs.
 
-### Credenciais & configuração
+## `sensitive_paths` (default: enforce)
 
-```
-\.env(\.local|\.production|\.development)?$      # .env, .env.local, ...
-\.env\.[a-z]+$                                    # qualquer variante .env.*
-config\.(php|json|yml|yaml|ini|conf)              # configs de app
-secrets\.(json|yml|yaml)
-credentials\.(json|csv)
-\.htpasswd
-wp-config\.php
-local\.xml                                        # Magento
-settings\.php                                     # Drupal
-configuration\.php                                # Joomla
-```
+Fonte única de verdade:
+[`lists::SENSITIVE_PATHS`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/lists.rs#L36)
+— a mesma tabela alimenta o pack, a heurística `SensitivePath` e os
+literais do prefilter Aho-Corasick. Cada padrão vira uma regra
+`path regex` case-insensitive (avaliada sobre o path URL-decodificado).
 
-### SCM & metadata de diretório
+Categorias cobertas:
 
-```
-/\.git/                                           # .git/, HEAD, config, index
-/\.svn/
-/\.hg/
-/\.bzr/
-/\.gitignore
-/\.gitattributes
-/\.dockerignore
-```
+- **Dotfiles e segredos** — `/.env`, `/.git`, `/.svn`, `/.hg`, `/.bzr`,
+  `/.ssh`, `/.aws`, `/.gcp`, `/.azure`, `/.kube`, `/.docker`,
+  `/.terraform`, `/.npmrc`, `/.pypirc`, `/.netrc`, `/.htpasswd`,
+  `/.DS_Store`.
+- **Painéis admin** — `wp-admin`, `wp-login.php`, `phpmyadmin`, `pma`,
+  `adminer`, `wp-content`, `/manager/html` (Tomcat),
+  `wp-includes/*.php`.
+- **Status de servidor** — `server-status`, `server-info`, `nginx-status`,
+  `fpm-status`.
+- **Spring Boot** — `/actuator/env`, `/actuator/heapdump`,
+  `/actuator/threaddump`.
+- **Backups e artefatos** — extensões `.sql`, `.bak`, `.backup`, `.old`,
+  `.swp`, `.orig`, `.save`.
+- **Probes de CVE conhecidos** — Laravel `_ignition/execute-solution`,
+  PHPUnit `eval-stdin.php`, Exchange `Autodiscover.xml` e
+  `/ecp/current/exporttool`, MobileIron `/mifs/.;/services/logservice`,
+  Telerik `WebResource.axd`, GPON `/gponform/diag_form`,
+  `/restapi/logoncustomization`, `/hnap1`, Fortinet `/remote/fgt_lang`.
 
-### Cloud & infraestrutura
-
-```
-/\.aws/                                           # credentials, config
-/\.ssh/                                           # id_rsa, id_ed25519, authorized_keys
-/\.gcp/
-/\.azure/
-/\.kube/                                          # kubeconfig
-/\.docker/                                        # config.json com tokens de registry
-/\.terraform(\.tfstate)?
-```
-
-### Arquivos de build & artefatos
-
-```
-/(package-lock\.json|yarn\.lock|composer\.lock)   # opcional: info de versão p/ recon
-/(docker-compose\.yml|docker-compose\.yaml)       # expõe topologia de serviços
-/(Dockerfile|Puppetfile|Vagrantfile)
-/\.npmrc                                          # tokens npm
-/\.pypirc                                         # tokens pypi
-/\.netrc                                          # creds HTTP
-```
-
-### Painéis admin & ferramentas conhecidas
-
-```
-/(wp-admin|wp-login\.php)                         # WordPress
-/(phpmyadmin|pma|phpMyAdmin)                      # phpMyAdmin
-/(adminer|adminer\.php)
-/(wp-content/uploads/phpmailer)                   # exploit comum
-/manager/                                         # Tomcat manager
-/server-status                                    # Apache mod_status
-/server-info
-/nginx-status
-/fpm-status
-/actuator(/env|/heapdump|/threaddump)?            # Spring Boot actuator sensível
-/health(/.*)?                                     # opcional (pode ser legit)
-```
-
-### Backup & dump
-
-```
-\.(sql|bak|backup|old|swp|tmp|orig|save|copy)$
-/(dump|backup|db)\.(sql|tar|gz|zip|tgz)
-/www\.(zip|tar|gz|rar|7z)                         # full-site dumps
-```
-
-### Sistema & expostos perigosos
-
-```
-/\.well-known/security\.txt$        # ALLOW (legítimo — RFC 9116) → allowlist explícita
-/\.DS_Store
-/Thumbs\.db
-/(etc/passwd|etc/shadow)             # path traversal via decode
-/(proc/self/environ|proc/self/fd/.*)
-```
-
-## Implementação técnica
-
-- Cada categoria é um *sub-pack* toggleável individualmente (`sentry rules
-  packs list` mostra estado granular).
-- A allowlist interna **sempre** permite `/.well-known/security.txt`
-  (RFC 9116 — documento público de divulgação responsável) mesmo com o pack
-  ativo.
-- Match case-insensitive (`.ENV` == `.env`) para evitar bypass trivial.
-- Considera encodings: `%2e` (`.`), `%2f` (`/`), `..;/` (path traversal
-  smuggling), double-encoding — normalização pré-match.
-- Rotas explicitamente allowlistadas pelo usuário
-  (`[[rules.custom]] action = "allow"`) têm prioridade sobre o pack,
-  permitindo expor `/admin/` se a app realmente precisar.
-
-## Por que `enforce` e não `shadow` desde o início
-
-Acessos a `.git/`, `.env`, `.ssh/` são estatisticamente 100% maliciosos em
-apps web (não há motivo legítimo para um browser acessar isso). O custo de
-um falso-positivo aqui é nulo vs. o risco de vazar credenciais.
-
-## Config no `sentry.toml`
+O pack também inclui uma regra **allow** com prioridade 1 para
+`/.well-known/security.txt` (RFC 9116), então o documento público de
+divulgação responsável nunca é bloqueado.
 
 ```toml
 [[rules.pack]]
 name = "sensitive_paths"
-mode  = "enforce"
+mode = "enforce"   # default — reduza para "shadow" se o site serve esses paths de verdade
+```
 
+## `honeypot_paths` (default: shadow)
+
+Baits largos no estilo do
+[nginx-honeypot](https://github.com/dvershinin/nginx-honeypot)
+([`HONEYPOT_PATHS`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/lists.rs#L118)):
+qualquer `.aspx`, `cgi-bin`, `node_modules`, `/actuator/health` e
+qualquer path de dotfile (`^/\.`). Num site real são genéricos demais para
+bloquear — em um decoy, qualquer hit é suspeito. O pack é só de regras:
+não entra no prefilter de heurísticas.
+
+```toml
 [[rules.pack]]
-name = "vpn_proxy"
-mode  = "shadow"
+name = "honeypot_paths"
+mode = "shadow"
+```
 
+## `host_allowlist` (default: off)
+
+Bloqueia requests cujo header `Host` **não** é um dos domínios
+configurados — inclui requests sem Host (scanners de IP puro e tentativas
+de homograph IDN). Implementado como `NOT header.host regex ...`
+([`host_allowlist_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L275)).
+
+```toml
 [[rules.pack]]
-name = "tor"
-mode  = "enforce"
+name = "host_allowlist"
+mode = "enforce"
 
+[rules.pack.params]
+domains = ["example.com", "www.example.com"]
+```
+
+## `crawlers_bad` (default: shadow)
+
+Uma única regra de UA regex
+([`bad_crawler_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L313))
+agregando ferramentas de pentest e scanners (`sqlmap`, `nikto`, `nmap`,
+`masscan`, `zgrab`, `nessus`, `gobuster`, `ffuf`, `nuclei`, `wfuzz`…),
+clients HTTP de script (`python-requests`, `go-http-client`, `curl/`…) e
+SEO/data bots agressivos (`semrush`, `ahrefs`, `mj12bot`, `bytespider`…).
+
+```toml
 [[rules.pack]]
 name = "crawlers_bad"
-mode  = "enforce"
+mode = "enforce"
+```
 
+## `crawlers_good` (default: off)
+
+Regras **`Allow`** por UA para bots legítimos
+([`good_crawler_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L449)).
+Com `[bot_verification] enabled = true` (F7.7) o pack se divide em dois:
+
+- `crawlers_good_verified` (prioridade 2) — engines **verificáveis** por
+  rDNS (`Googlebot`, `Bingbot`, `Slurp`, `Baiduspider`, `YandexBot`) com a
+  condição extra `bot_verified = "true"`: UA falso não ganha allow.
+- `crawlers_good_unverified_ok` (prioridade 3) — engines não verificáveis
+  por rDNS (`DuckDuckBot`, `facebookexternalhit`, `Twitterbot`,
+  `LinkedInBot`, `Applebot`, `Puppeteer`, `WhatsApp`, `TelegramBot`,
+  `Discordbot`, `W3C_Validator`, `curl/8`, `Go-http-client/1.1`) continuam
+  com allow simples por UA.
+
+Sem verificação de bots, o pack volta a ser uma regra única com a lista
+combinada.
+
+```toml
 [[rules.pack]]
 name = "crawlers_good"
-mode  = "enforce"         # allow Googlebot etc.
+mode = "enforce"   # ação é sempre Allow — o modo só liga o pack
+```
 
+## `empty_ua` (default: shadow)
+
+UA vazio (`UserAgent equals ""`) → `Challenge` em enforce
+([`empty_ua_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L337)).
+Raro em tráfego legítimo de browser.
+
+## `http_anomaly` (default: shadow)
+
+Métodos raros `TRACE` e `CONNECT` → `Block` em enforce
+([`http_anomaly_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L361)),
+duas regras de prioridade 12.
+
+## `vpn_proxy` (default: shadow)
+
+`reputation = "vpn"` → `Challenge` em enforce
+([`vpn_proxy_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L398)).
+Só funciona de verdade com uma feed IP de tier `vpn` configurada (presets
+`open_source_vpn_ips` / `anti_vpn`) — sem feed, o tier nunca é atribuído e
+a regra nunca bate.
+
+## `tor` (default: shadow)
+
+`reputation = "tor"` → `Block` em enforce
+([`tor_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L420)).
+Requer o preset `tor_exit` (ou feed equivalente) — sem feed, nunca bate.
+
+## `rate_scan` (default: shadow)
+
+Regra `rate_scan_404`
+([`rate_scan_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L498)):
+`status=404 AND rate 10/60s per_ip` → `RateLimit` em enforce (directory
+brute-force). O filtro de `Status(404)` é real — a janela de rate só conta
+404s. Requer o rate-limit backend do daemon.
+
+## `country_blocklist` (default: off)
+
+`country = <código>` → `Block` em enforce, para a lista configurada
+([`country_blocklist_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L527)).
+Códigos ISO 3166-1 alpha-2, comparação case-insensitive. Requer o param
+`countries` — sem ele o pack não gera regras.
+
+```toml
 [[rules.pack]]
 name = "country_blocklist"
-mode  = "enforce"
-countries = ["RU","CN","KP"]   # ISO codes
+mode = "enforce"
+
+[rules.pack.params]
+countries = ["RU", "CN", "KP"]
 ```
+
+## Datasets e reputation feeds
+
+Além dos packs, `[[rules.feeds]]` gera regras sintéticas `feed:<nome>`
+(prioridade 50, fonte `Feed`) via
+[`feed_rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L210)
+e
+[`dataset_rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L274):
+
+| `kind`        | O que gera                                                                       | `action` default          |
+|---------------|-----------------------------------------------------------------------------------|----------------------------|
+| `ip`          | Enriquecimento ([`ReputationStore`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs) longest-prefix) + regra sintética só se `action` declarado | (sem regra) |
+| `user_agent`  | Uma regra UA — lista inteira numa alternância literal case-insensitive (cap [`MAX_DATASET_ENTRIES`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L255) = 5000) | `log` |
+| `path`        | Idem, sobre o path                                                                | `log`                      |
+| `ja3`         | [`RuleMatch::Ja3In`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L409) — conjunto de hashes (só eventos de handshake TLS) | `log` |
+
+Campos: `name`, `url` (http/https com guarda SSRF), `kind`, `tier` (só
+`ip`; default `malicious`), `action`, `refresh_hours` (default 24),
+`headers_env` (headers autenticados), `enabled` (default true).
+
+```toml
+[[rules.feeds]]
+name = "spamhaus_drop"
+url  = "https://www.spamhaus.org/drop/drop.txt"
+tier = "malicious"
+refresh_hours = 24
+action = "block"          # sem action: só enriquece (tor/vpn_proxy passam a funcionar)
+
+[[rules.feeds]]
+name = "bad_bots_ultimate"
+kind = "user_agent"
+url  = "https://raw.githubusercontent.com/mitchellkrogza/nginx-ultimate-bad-bot-blocker/master/_generator_lists/bad-user-agents.list"
+refresh_hours = 24
+action = "log"            # comece em shadow; vire "block" depois de auditar
+
+[[rules.feeds]]
+name = "probe_paths"
+kind = "path"
+url  = "https://example.invalid/probe-paths.txt"
+refresh_hours = 24
+action = "challenge"
+
+[[rules.feeds]]
+name = "abuseipdb_blacklist"
+url  = "https://api.abuseipdb.com/api/v2/blacklist?confidenceMinimum=90&plaintext=true"
+tier = "malicious"
+refresh_hours = 24
+headers_env = { Key = "SENTRY_ABUSEIPDB_KEY" }
+```
+
+**Presets** — em vez de escrever feeds na mão,
+`[rules] feed_presets = ["tor_exit", "firehol_level1", "proxy_list",
+"open_source_vpn_ips", "anti_vpn"]` habilita blocklists públicas curadas;
+**presets bloqueiam por default** — habilite só se aceitar banir essas
+faixas (ex.: usuários de VPN).
+
+**Datasets DB-backed (F7.7)** — o equivalente Postgres das feeds
+`user_agent`/`path`/`ja3`, sem TOML:
+`sentry datasets import <arquivo|url> --kind user_agent --name <nome> [--action block]`,
+mais `list|enable|disable|delete|fetch`. Regras ganham id `dataset:<nome>` e são
+hot-reloadadas (junto com os literais do prefilter) pelo canal
+`sentry_datasets_changed`. Use datasets para listas que mudam sem deploy;
+use `[[rules.feeds]]` para listas versionadas no config.

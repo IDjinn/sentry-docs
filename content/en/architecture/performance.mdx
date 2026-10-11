@@ -1,0 +1,135 @@
+---
+title: "Performance"
+description: "Pipeline benchmarks, two-lane hot path, overload response and edge tuning"
+---
+
+# Performance
+
+The numbers and methodology on this page come from
+[`ARCHITECTURE.md` §22](https://github.com/IDjinn/sentry/blob/main/ARCHITECTURE.md)
+(F5, criterion benchmarks) and §27 (F12, edge tuning). The benchmarks live
+in [`crates/sentry-core/benches/perf.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/benches/perf.rs)
+(`cargo bench -p sentry-core`; 5 scenarios, 40 samples, 3 s; Windows 11,
+MSVC, release with thin LTO).
+
+## Pipeline end-to-end: 3.49 ms → 4.36 µs (~800×)
+
+| Benchmark (1 event) | Before | After | Gain |
+| --- | --- | --- | --- |
+| heuristics/clean | 1.90 µs | 0.48 µs | 4.0× |
+| heuristics/attack | 2.94 µs | 1.59 µs | 1.8× |
+| rules/clean | 3.37 ms | 2.47 µs | ~1,360× |
+| pipeline/clean (end-to-end) | **3.49 ms** | **4.36 µs** | **~800×** |
+| pipeline/attack (end-to-end) | 3.27 ms | 5.79 µs | ~565× |
+
+Where the time was and what changed (§22):
+
+1. **Regex per rule per event** — the dominant bottleneck: each
+   `Path regex` condition recompiled hundreds of µs per event. A global
+   `REGEX_CACHE` (and an `IP_CACHE` for CIDR) now compiles once per
+   pattern per process; the input is config/DB, never attacker data, so
+   the cache is bounded by the ruleset size
+   ([`rules.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs)).
+2. **Aho-Corasick prefilter in the heuristics** ([`heuristics.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs)) —
+   a single automaton (SIMD via memchr, case-insensitive) over ~90 trigger
+   literals runs **one pass** per event; families whose trigger is absent
+   never execute regex. Clean traffic = zero regex (gated×ungated
+   equivalence tested + a proptest).
+3. **Decode-once** — path/query are URL-decoded once per evaluation
+   (`EvalCtx`/`DecodedHttp`) and shared across the condition tree and all
+   detectors.
+4. **Trackers with bounded history** — repetition 128 entries/IP,
+   auth/wordlist 64/IP: per-IP windows no longer grow without bound under
+   attack.
+5. **Allocation-free dedupe** — an LRU keyed by a `u64` hash with a sweep
+   at most 1×/TTL; the same hash becomes the `payload_hash` for cross-node
+   dedupe (F4.7).
+6. **Batched ingest** — `recv_many(64)` drains up to 64 ready events per
+   loop wakeup.
+
+Honest limits (§22): microbenchmark numbers (warm cache, 1 synthetic IP);
+real throughput is dominated by source I/O and Postgres latency. The
+trackers remain per-node in memory (§8.4).
+
+In the protocol domain (F9,
+[`ARCHITECTURE.md` §24](https://github.com/IDjinn/sentry/blob/main/ARCHITECTURE.md)),
+a compiled frame costs ~0.68 µs vs the regex baseline ~20.8 µs (~30×), and
+`read_until` with memchr 27 ns vs scalar 1.10 µs (~41×).
+
+## Two-lane hot path
+
+The ingest loop never waits on external I/O
+([`daemon.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs)):
+
+- **Inline lane** — local containment: blocklist, log, kernel firewall.
+  These run in the loop itself.
+- **Deferred lane** — network actions (Cloudflare, nginx, OPNsense,
+  webhook, report) on post-processing workers
+  (`[core] action_buffer`/`action_workers`; 1 worker = strict ordering).
+  Incident context is computed 1×/event, not 1×/action.
+- The event travels shared as an `Arc<ProcessedEvent>` (printer +
+  persistence + queue without deep clones); `print_event` left the hot
+  path.
+- **Under overload the action queue fills first — actions are shed, never
+  events** (`sentry_action_queue_drops_total`). Source-channel drops
+  become `sentry_events_dropped_total{source}` with an aggregated log via
+  `DropLogThrottle` (5 s) instead of one `error!` per event.
+
+## Overload response — degradation in telemetry tiers
+
+Detection and containment **never** degrade; what degrades is telemetry
+(persistence/console/eventlog). The 5 s monitor measures queue occupancy +
+Postgres (pool acquired ≥ 90% or INSERT EMA ≥ `pg_insert_budget_ms`) with
+hysteresis and flips the shared
+[`OverloadState`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/overload.rs)
+flag:
+
+| Tier | Effect |
+| --- | --- |
+| Batched persistence | the worker drains the queue with `recv_many` → one multi-INSERT per batch; security events fall back to a direct write when the queue is full |
+| Sampling by IP | under pressure, Allow-below-High events are sampled deterministically per IP (`sample_keep`, default 0.1 — an IP is consistently in or out); Block/High always 100% (`sentry_overload_shed_total{tier}`) |
+| Benign coalescing | Allow GETs with no signals collapse per (ip, path) into 1 persistence per `coalesce_window_secs` window (60 s, cap 4096); repeats become `sentry_coalesced_requests_total{kind="benign"}` ([`BenignCoalescer`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/overload.rs#L137)) |
+| AI/LLM forks | inference for benign events is skipped under pressure (forks only raise verdicts — under overload the cost is not worth it) |
+| Edge cheap mode | the inline edge skips inspection/upload buffering; compression turns itself off (CPU shed before bytes) |
+| SYN aggregation | the TCP source joins bursts into 1 event per IP/window (`syn_window_ms`, `TcpData.syn_count`) |
+
+Defaults (`[overload]`): `queue_pressure` 0.8, `release_pressure` 0.5,
+`release_secs` 30, `pg_insert_budget_ms` 250, `sample_keep` 0.1.
+
+## Edge tuning (F12, §27)
+
+- **Compression** ([`compression.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/compression.rs)):
+  synchronous re-encode over the already-buffered body (no stream, exact
+  content-length); hand-rolled negotiation preferring zstd > brotli > gzip;
+  turns itself off under overload. Metric
+  `sentry_edge_compressed_total{algo}`.
+- **Upstream hop**: keepalive pool (`upstream_pool_idle` 32/host, idle 90 s,
+  TCP keepalive 60 s), `tcp_nodelay` and a 5 s `connect_timeout` — zero
+  TCP handshake per request on the edge→backend hop.
+- **HTTP/2 on TLS** (`[edge] http2`, default true): ALPN `h2` + `http/1.1`
+  on the same router; `sentry_edge_tls_alpn_total{alpn}` counts
+  negotiations.
+- **Concurrency cap** (`max_concurrent_requests`, default 1024): bounded
+  memory — past the cap, an immediate 503 instead of buffering.
+- **BlockTable fast-path**: a blocked IP costs O(1) and produces **no**
+  event — floods against already-blocked IPs never pay for the pipeline or
+  webhooks.
+
+## Performance metrics
+
+| Metric | What it measures |
+| --- | --- |
+| `sentry_action_queue_drops_total` | Actions shed when the deferred queue fills |
+| `sentry_events_dropped_total{source}` | Per-source channel drops |
+| `sentry_queue_occupancy{queue}` | Fan-in/deferred/persist queue occupancy |
+| `sentry_postgres_pressure` | 1 = pressure mode active (gauge) |
+| `sentry_overload_shed_total{tier}` | Events sampled out per tier |
+| `sentry_coalesced_requests_total{kind}` | Coalesced benign requests |
+| `sentry_persist_duration_seconds` | Batched INSERT latency |
+| `sentry_edge_compressed_total{algo}` | Compressed responses per algorithm |
+| `sentry_edge_block_hits_total` / `sentry_block_table_size` | Block fast-path |
+| `sentry_edge_request_duration_seconds` | Edge request latency (pipeline included) |
+
+The pipeline measures `process_us` per event (TUI/console and
+`ProcessedEvent.process_us`); on the edge, latency lives in the edge
+histogram and the event arrives with the verdict already applied.

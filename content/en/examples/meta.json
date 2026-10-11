@@ -1,0 +1,4 @@
+{
+  "title": "Examples",
+  "pages": ["index", "mozi-rce", "mozi-propagation", "mcp-scanner", "upload-field-rce"]
+}

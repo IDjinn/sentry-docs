@@ -11,12 +11,16 @@ description: "Docker, build local e configuração básica"
 docker compose -f deploy/docker/docker-compose.yml up -d
 ```
 
+O compose faz o build da imagem e sobe dois serviços: `sentry` (daemon +
+Postgres configurado via env) e `postgres` (banco de eventos/incidentes/regras).
+Detalhes completos em [Deploy com Docker](./deploy/docker).
+
 Segredos vão em variáveis de ambiente, nunca no config:
 
 ```bash
 export SENTRY_CF_TOKEN=xxx        # Cloudflare API token (opcional)
 export SENTRY_CF_ZONE=yyy         # Cloudflare zone ID (opcional)
-export SENTRY_LLM_KEY=zzz         # OpenRouter key (opcional)
+export SENTRY_LLM_KEY=zzz         # LLM key (opcional; OpenRouter/Ollama/…)
 export SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
 ```
 
@@ -24,55 +28,100 @@ export SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
 
 ```bash
 cargo build --release
-./target/debug/sentry config validate
-./target/debug/sentry run
+./target/release/sentry config validate
+./target/release/sentry run
+```
+
+Features pesadas são opt-in e não entram no build default:
+
+```bash
+cargo build --release --features sentry-cli/onnx       # IA local (ONNX)
+cargo build --release --features sentry-cli/edge-tls   # TLS 443 (JA3/JA4)
+cargo build --release --features sentry-cli/edge-zstd  # compressão zstd
 ```
 
 ## Configuração
 
-Copie `config/sentry.example.toml` → `sentry.toml` e edite. O overlay de env
-(`SENTRY_<SECTION>__<KEY>`) sobrescreve qualquer campo do TOML.
+Copie [`config/sentry.example.toml`](https://github.com/IDjinn/sentry/blob/main/config/sentry.example.toml)
+→ `sentry.toml` e edite. O binário procura `sentry.toml` no diretório corrente
+ou `/etc/sentry/sentry.toml`; sobrescreva com `--config` ou `SENTRY_CONFIG`.
+O overlay de env (`SENTRY_<SECTION>__<KEY>`) sobrescreve qualquer campo do
+TOML — por isso `SENTRY_STORAGE__POSTGRES__URL` funciona sem tocar no arquivo.
+
+Config mínima funcional (source nginx + Postgres + packs + actions):
 
 ```toml
 [core]
 data_dir = "/var/lib/sentry"
-storage  = "postgres"
 
 [storage.postgres]
-url = "postgres://sentry:secret@localhost/sentry"
+url = "postgres://sentry:changeme@localhost:5432/sentry"
+
+[[rules.pack]]
+name = "sensitive_paths"
+mode  = "enforce"            # shadow | enforce | off
 
 [[source]]
-type   = "nginx"
-path   = "/var/log/nginx/access.log"
-format = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\""
+type = "nginx"
+[source.options]
+path = "/var/log/nginx/access.log"
+format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
 
-[analysis]
-risk_threshold_challenge = 50
-risk_threshold_block     = 75
-learn_unknown_routes     = true
+[[action]]
+type = "blocklist"
+[action.options]
+ttl_secs = 86400
 
 [[action]]
 type = "log"
 ```
 
+O mapeamento de veredito é configurável em `[policy]` (default: Info/Low →
+allow, Medium → rate_limit, High → challenge, Critical → block). Referência
+completa de todas as seções em [Configuração](./config).
+
 ## Rodando o monitor
 
 ```bash
 sentry run                  # inicia o daemon (foreground)
-sentry tail                # live tail de eventos + risk colorido
+sentry config validate      # valida a config
+sentry tail                 # live tail de eventos + risk colorido (TUI)
 sentry tail --only High,Critical
-sentry config validate     # valida a config
+sentry tail --stream --json # uma linha JSONL por evento (fora de TTY, auto)
+sentry serve                # dashboard web + JSON API (requer Postgres)
+sentry test "<payload>" --path /login --method POST   # dry run do pipeline
 ```
+
+O dashboard (`sentry serve`) serve a SPA embutida em `[server] host/port`
+(default `127.0.0.1:8080`) com feed de eventos, incidentes, IPs bloqueados e
+auth opcional Argon2id + RBAC (`sentry auth hash-password`).
 
 ## Rules e packs
 
 O rules engine roda **antes** das heurísticas e da IA (fast path). Ordem de
-precedência: `Allow` > `Block`/`Challenge`/`RateLimit` > `Log`/`Tag` > cai
-para heurísticas + IA.
+precedência: `Allow` (bypass total) > `Block`/`Challenge`/`RateLimit`
+(short-circuit) > `Log`/`Tag` (anota e continua) > cai para heurísticas + IA.
 
-Packs default: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`,
-`sensitive_paths`, `country_blocklist`, `http_anomaly`, `rate_scan`. Cada
-pack roda em `shadow` (log only), `enforce` (act), ou `off`.
+Packs default ([`packs.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs)):
+`vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`, `sensitive_paths`,
+`empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist`, `honeypot_paths`,
+`host_allowlist`. Cada pack roda em `shadow` (log only), `enforce` (age) ou
+`off` — `sensitive_paths`, `crawlers_bad` e `crawlers_good` já vêm em
+`enforce`; os demais em `shadow` ou `off`.
+
+Gerencie por cima do engine com `sentry rules packs | list | test`,
+`sentry feeds list | refresh | check <ip>` e
+`sentry datasets import | list | enable | disable` (listas UA/path/JA3 no
+Postgres, hot-reload nos daemons vivos).
 
 > **Para produção**: comece com tudo em `shadow` e observe os logs antes de
 > trocar para `enforce`.
+
+## Próximos passos
+
+- [Rules Engine](./rules) — DSL, packs e datasets.
+- [Plugins](./plugins) — sources, actions e challenge providers.
+- [IA](./ai) — heurísticas, ONNX local, LLM opcional.
+- [CLI](./cli) — referência completa de comandos.
+- [Configuração](./config) — referência do `sentry.toml`.
+- [Deploy](./deploy) — Docker, Kubernetes, Vercel.

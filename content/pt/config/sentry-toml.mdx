@@ -1,143 +1,684 @@
 ---
-title: "Referência de Config"
-description: "sentry.toml e overlay de env vars"
+title: "Referência de Configuração (sentry.toml)"
+description: "Todas as seções do sentry.toml — campos, tipos, valores padrão e exemplos, conforme o schema em crates/sentry-core/src/config.rs."
 ---
 
-# Referência de Config (`sentry.toml`)
+# Referência de Configuração (`sentry.toml`)
 
-A configuração é declarativa em TOML, com overlay de variáveis de ambiente
-via `figment` (prefixo `SENTRY_`, separador `__`). O overlay sobrescreve
-qualquer campo do TOML — útil em prod para segredos.
+Toda a configuração do Sentry vive em um único arquivo TOML. O schema tipado é o struct [`SentryConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L14) em `crates/sentry-core/src/config.rs` — esta página documenta cada seção com campos, tipos e valores padrão extraídos dele. O arquivo [`config/sentry.example.toml`](https://github.com/IDjinn/sentry/blob/main/config/sentry.example.toml) é o exemplo canônico pronto para copiar.
 
-## Arquivo completo de exemplo
+## Índice
+
+- [Carregamento e overlay de ambiente](#carregamento-e-overlay-de-ambiente)
+- [`[core]`](#core)
+- [`[overload]`](#overload)
+- [`[deployment]`](#deployment)
+- [`[storage.postgres]`](#storagepostgres)
+- [`[[source]]`](#source)
+- [`[geo]`](#geo)
+- [`[routes]`](#routes)
+- [`[route_learner]`](#route_learner)
+- [`[rules]`](#rules)
+- [`[scorer]`](#scorer)
+- [`[policy]`](#policy)
+- [`[escalation]`](#escalation)
+- [`[scan]`](#scan)
+- [`[behavior]`](#behavior)
+- [`[correlation]`](#correlation)
+- [`[rate_limit]`](#rate_limit)
+- [`[real_ip]`](#real_ip)
+- [`[ip_lookup]`](#ip_lookup)
+- [`[bot_verification]`](#bot_verification)
+- [`[ai]`](#ai)
+- [`[llm]`](#llm)
+- [`[edge]`](#edge)
+- [`[uploads]`](#uploads)
+- [`[posture]`](#posture)
+- [`[protocol]`](#protocol)
+- [`[metrics]`](#metrics)
+- [`[server]`](#server)
+- [`[[action]]`](#action)
+- [Validação e segredos](#validação-e-segredos)
+
+## Carregamento e overlay de ambiente
+
+O arquivo é carregado com `figment`: o TOML é a base e **qualquer campo pode ser sobrescrito por variável de ambiente** no formato `SENTRY_<SEÇÃO>__<CHAVE>` (maiúsculas, `__` separa níveis de aninhamento). Segredos **nunca** vão no arquivo commitado — só em env.
+
+| Variável | Sobrescreve / alimenta |
+| --- | --- |
+| `SENTRY_STORAGE__POSTGRES__URL` | `[storage.postgres] url` |
+| `SENTRY_CF_TOKEN` | token da API Cloudflare (sources/actions CF) |
+| `SENTRY_CF_ZONE` | zone ID da Cloudflare (action challenge) |
+| `SENTRY_CF_ACCOUNT` | account ID da Cloudflare (IP Lists /64) |
+| `SENTRY_LLM_KEY` | chave da API do provedor LLM |
+| `SENTRY_ABUSEIPDB_KEY` | chave da AbuseIPDB (`[ip_lookup]`, action report, feeds) |
+| `SENTRY_SESSION_SECRET` | chave HMAC das sessões do dashboard |
+| `SENTRY_WEBHOOK_SECRET` | segredo de assinatura HMAC dos webhooks |
+| `SENTRY_EDGE_CHALLENGE_SECRET` | segredo do PoW do challenge da edge |
+
+## [`[core]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L106)
+
+Runtime principal: buffers de filas e tuning do caminho quente de ingest. Sob sobrecarga a fila de actions enche primeiro — o Sentry descarta **actions**, nunca eventos.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `data_dir` | string (caminho) | `/var/lib/sentry` | Diretório de dados (arquivos MMDB, modelos, cache). |
+| `channel_buffer` | inteiro | `4096` | Tamanho do buffer do canal de eventos entre sources e daemon. |
+| `action_buffer` | inteiro | `4096` | Capacidade da fila de actions postergadas (workers de pós-processamento). |
+| `action_workers` | inteiro | `1` | Workers paralelos que executam actions de rede. `1` preserva a ordem estrita das actions. |
+| `persist_buffer` | inteiro | `2048` | Capacidade da fila de persistência em lote (um multi-INSERT por lote). |
+| `dedupe_ttl_secs` | inteiro | `10` | Janela de dedupe de ingest: eventos idênticos (ip, method, path) dentro da janela caem fora antes do pipeline. |
 
 ```toml
 [core]
 data_dir = "/var/lib/sentry"
-storage  = "sqlite"        # sqlite | postgres
+action_workers = 1
+dedupe_ttl_secs = 10
+```
 
-[storage.postgres]
-url = "postgres://..."
+## [`[overload]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L176)
 
+Resposta a sobrecarga: pressão medida (ocupação de filas, latência de INSERT no Postgres) liga a degradação em tiers de **telemetria**. Detecção (pipeline) e contenção (block table, actions) nunca degradam.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Liga a detecção de pressão e os tiers de degradação. |
+| `queue_pressure` | float | `0.8` | Ocupação de fila (0.0–1.0) que liga a pressão. |
+| `release_pressure` | float | `0.5` | Ocupação abaixo da qual a pressão desliga (histerese). |
+| `release_secs` | inteiro | `30` | Segundos de alívio sustentado antes de limpar a pressão. |
+| `pg_insert_budget_ms` | inteiro | `250` | EMA de latência de INSERT (ms) que liga a pressão sozinha. |
+| `sample_keep` | float | `0.1` | Fração de eventos de baixa prioridade (Allow < High) mantida sob pressão — determinística por IP de origem. |
+| `coalesce_benign` | bool | `true` | Colapsa requisições benignas repetidas (Allow, GET, sem sinais) por (ip, path). |
+| `coalesce_window_secs` | inteiro | `60` | Janela de coalescência benigna: só o primeiro hit persiste. |
+| `coalesce_cap` | inteiro | `4096` | Máximo de buckets (ip, path) rastreados; o mais antigo é evictado. |
+
+## [`[deployment]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1468)
+
+Posicionamento do Sentry relativo à aplicação.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `mode` | string | `passive` | `passive` lê logs/tráfego espelhado e age ex-post via actions; `inline` roda o reverse proxy da [`[edge]`](#edge) na frente do app e aplica vereditos antes da requisição chegar ao backend. |
+| `instance_id` | string | *(hostname)* | Rótulo de instância para métricas em deployments multi-nó (gauge `sentry_instance_info`). Vazio = deriva do hostname. |
+
+## [`[storage.postgres]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L274)
+
+Conexão de persistência (Postgres via sqlx).
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `url` | string | *(vazio)* | String de conexão `postgres://user:pass@host:port/db`. Prefira `SENTRY_STORAGE__POSTGRES__URL`. |
+| `max_connections` | inteiro | `10` | Tamanho do pool de conexões. |
+| `acquire_timeout_secs` | inteiro | `5` | Segundos esperando por uma conexão livre antes de falhar rápido (default do sqlx é 30). |
+| `statement_timeout_secs` | inteiro | `30` | Segundos de INSERT antes de cancelar e descartar o lote, evitando travar o worker de persistência. |
+
+## [`[[source]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2063)
+
+Fontes de eventos: cada entrada declara um plugin `type` e um mapa `options` próprio do plugin. Tipos implementados: `nginx`, `syslog`, `cloudflare` e `tcp` (tipo desconhecido é ignorado com um log).
+
+**`type = "nginx"`** — tail de access.log do nginx com parser de `log_format` e resolução automática do IP real.
+
+| Option | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `path` | string | `/var/log/nginx/access.log` | Caminho do arquivo de log. |
+| `format` | string | formato *combined* | Mesma string do `log_format` do nginx. Tokens `$http_*` viram headers do evento (usáveis em regras DSL como `header.cf-connecting-ip`). |
+
+```toml
 [[source]]
-type   = "nginx"
-path   = "/var/log/nginx/access.log"
-format = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\""
+type = "nginx"
+[source.options]
+path = "/var/log/nginx/access.log"
+format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+```
 
-[[source]]
-type = "cloudflare"
-zone = "example.com"
-poll_secs = 30
+**`type = "syslog"`** — receptor RFC 5424 (fallback RFC 3164) para firewalls e equipamentos de rede; o endereço do peer vira o IP do cliente.
 
-[analysis]
-risk_threshold_challenge = 50
-risk_threshold_block     = 75
-learn_unknown_routes     = true
+| Option | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `bind` | string | `0.0.0.0:5140` | Endereço de escuta (portas < 1024 exigem root). |
+| `transport` | string | `udp` | `udp` \| `tcp` (TCP aceita framing newline e octet-counting RFC 6587). |
 
-[analysis.ai]
-onnx_model = "models/sentry-payload-v1.onnx"
-llm_provider = "ollama"      # none | openai | ollama
-llm_model = "qwen2.5:7b"
-llm_only_above = 30
+**`type = "cloudflare"`** — polling da Logs API da Cloudflare (NDJSON); requer plano Enterprise e token com permissão Logs:Read via env.
 
-[geo]
-db_path = "/var/lib/sentry/GeoLite2-City.mmdb"
+| Option | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `zone_id` | string | *(obrigatório)* | Zone ID da Cloudflare. |
+| `token_env` | string | `SENTRY_CF_TOKEN` | Variável de ambiente com o API token. |
+| `poll_secs` | inteiro | `30` | Intervalo entre polls. |
+| `start` | string (RFC 3339) | *(agora)* | Cursor da primeira consulta. |
+| `api_base` | string | `https://api.cloudflare.com/client/v4` | Base da API. |
 
-[scorer]
-# pesos dos sinais (sobrescreve defaults)
+**`type = "tcp"`** — captura passiva de pacotes com fingerprinting de SYN (masscan/zmap/nmap). Exige o build feature `pcap` e privilégios (Npcap no Windows, `CAP_NET_RAW` no Linux).
 
-[routes]
-known = [
-  { path = "/", methods = ["GET"] },
-  { path = "/api/users", methods = ["GET","POST"] },
-  { path = "/admin/*", methods = ["GET"], auth_required = true },
-]
+| Option | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `interface` | string | *(obrigatório)* | Interface de captura. |
+| `ports` | string (CSV) | *(vazio = todas)* | Filtro de portas de destino, ex. `"80,443,8443"`. |
+| `payload_cap` | inteiro | `8192` | Bytes reassemblados mantidos por flow. |
+| `flow_cap` | inteiro | `65536` | Máximo de flows rastreados (eviction FIFO). |
+| `channel_buffer` | inteiro | `1024` | Fila entre o loop de captura e o daemon (mínimo 64). |
+| `syn_window_ms` | inteiro | `100` | Janela de coalescência de SYN por IP (`0` = off); a rajada vira 1 evento com `TcpData.syn_count`. |
 
-[[action]]
-type = "cloudflare"
-mode = "managed_challenge"
-ttl_hours = 24
+## [`[geo]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L317)
 
-[[action]]
-type = "webhook"
-url = "https://discord.com/api/webhooks/..."
-on_levels = ["High","Critical"]
+Enriquecimento Geo/ASN com os bancos GeoLite2 da MaxMind. Arquivos ausentes = enriquecimento vira no-op silencioso.
 
-[[action]]
-type = "log"   # sempre
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `city_db` | string (caminho) | `/var/lib/sentry/GeoLite2-City.mmdb` | Banco GeoLite2-City. |
+| `asn_db` | string (caminho) | `/var/lib/sentry/GeoLite2-ASN.mmdb` | Banco GeoLite2-ASN. |
 
-# Rules engine
-[[rules.pack]]
-name = "sensitive_paths"
-mode  = "enforce"
+## [`[routes]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L345)
 
-[[rules.pack]]
-name = "vpn_proxy"
-mode  = "shadow"
+Rotas que sua aplicação realmente serve. Requisições fora do conjunto (ou com método não permitido) geram o sinal `UnknownRoute`.
 
-[[rules.pack]]
-name = "tor"
-mode  = "enforce"
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `known` | array de [`[[routes.known]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L353) | `[]` | Cada entrada: `path` (exato ou glob `/api/*`) e `methods` (vazio = qualquer método). |
 
-[[rules.pack]]
-name = "crawlers_bad"
-mode  = "enforce"
+```toml
+[[routes.known]]
+path = "/api/users/*"
+methods = ["GET", "POST", "PATCH", "DELETE"]
+```
 
-[[rules.pack]]
-name = "crawlers_good"
-mode  = "enforce"         # allow Googlebot etc.
+## [`[route_learner]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1799)
 
+Aprendizado contínuo de rotas: task em background que infere shapes de rota estáveis a partir de eventos recentes no Postgres e faz hot-reload delas. Requer storage Postgres.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Liga o learner contínuo. |
+| `interval_secs` | inteiro | `300` | Frequência de cada passada de aprendizado. |
+| `window_secs` | inteiro | `3600` | Janela de look-back dos eventos. |
+| `min_hits` | inteiro | `10` | Hits mínimos para um shape ser considerado estável. |
+| `min_ips` | inteiro | `2` | Mínimo de IPs distintos que acessaram o shape. |
+
+## [`[rules]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1901)
+
+Motor de regras: packs padrão, regras estáticas inline, feeds de reputação e presets.
+
+### [`[[rules.pack]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1921)
+
+Packs padrão do motor de regras.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `name` | string | — | Nome do pack (lista abaixo). |
+| `mode` | string | `shadow` | `shadow` (só anota/loga) \| `enforce` (age) \| `off`. |
+| `params` | tabela | `{}` | Parâmetros extras do pack (ex.: `countries`, `domains`), achatados como `<pack>__<param>`. |
+
+Packs disponíveis: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good` (divide-se em `crawlers_good_verified` / `crawlers_good_unverified_ok` com o bot verification ativo), `sensitive_paths` (único em `enforce` por padrão), `empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist` (`params.countries`), `honeypot_paths` e `host_allowlist` (`params.domains`).
+
+```toml
 [[rules.pack]]
 name = "country_blocklist"
-mode  = "enforce"
-countries = ["RU","CN","KP"]   # ISO codes
+mode  = "off"
+[rules.pack.params]
+countries = ["RU", "CN"]
+```
 
-# regras estáticas inline (além das do DB)
+### [`[[rules.custom]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1948)
+
+Regras estáticas inline (além das gerenciadas pelo DB).
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `name` | string | — | Nome legível da regra. |
+| `priority` | inteiro | `0` | Menor = avaliada primeiro. |
+| `match` | string (DSL) | — | Expressão de match; parse falho derruba a carga da config. |
+| `action` | string | — | `allow` \| `block` \| `challenge` \| `rate_limit` \| `log` \| `tag`. |
+| `tags` | array de string | `[]` | Tags livres para agrupamento. |
+| `log_level` | string | `info` | Verbosidade no console: `silent` \| `info` \| `warn` \| `error`. |
+
+```toml
 [[rules.custom]]
 name = "allow internal monitoring"
 priority = 1
 match = 'ip=10.0.0.0/8'
 action = "allow"
+log_level = "silent"
+```
 
-[[rules.custom]]
-name = "challenge datacenter ASN outside business hours"
-priority = 20
-match = 'asn=14061 AND time outside(09:00-18:00 America/Sao_Paulo)'
-action = "challenge"
+### [`[[rules.feeds]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1969)
 
-# reputation feeds
-[[rules.feed]]
+Feeds de reputação e datasets (listas uma-por-linha).
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `name` | string | — | Nome da feed (prefixo da tag da regra sintética). |
+| `url` | string | — | URL http/https (hosts loopback/privados são rejeitados — guarda SSRF). |
+| `kind` | string | `ip` | [`ip`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2007) \| `user_agent` \| `path` \| `ja3` — listas uma-por-linha viram regra sintética. |
+| `refresh_hours` | inteiro | `24` | Intervalo de refresh em horas. |
+| `tier` | string | `malicious` | `unknown` \| `clean` \| `suspicious` \| `malicious` \| `datacenter` \| `vpn` \| `tor` \| `authorized` \| `promiscuous` (só para `kind = "ip"`). |
+| `action` | string | *(vazio)* | Para `ip`: vazio = só enriquecimento; para `user_agent`/`path`: vazio = `log`. Valores: `block` \| `challenge` \| `rate_limit` \| … |
+| `enabled` | bool | `true` | Pausa a feed sem removê-la. |
+| `headers_env` | tabela | `{}` | Mapa header → env var para feeds autenticadas (ex.: `Key = "SENTRY_ABUSEIPDB_KEY"`). |
+
+```toml
+[[rules.feeds]]
 name = "spamhaus_drop"
 url  = "https://www.spamhaus.org/drop/drop.txt"
+tier = "malicious"
 refresh_hours = 24
 action = "block"
 ```
 
-## Overlay de variáveis de ambiente
+Datasets DB-backed (o equivalente Postgres das feeds `user_agent`/`path`/`ja3`) não têm entrada TOML — gerencie via `sentry datasets import | list | enable | disable | delete | fetch`.
 
-Qualquer campo do TOML pode ser sobrescrito via env var no formato
-`SENTRY_<SECTION>__<KEY>` (path em uppercase, `__` separa níveis de
-objeto). Exemplos:
+### `feed_presets`
 
-| Env var                                   | Sobrescreve                          |
-|-------------------------------------------|--------------------------------------|
-| `SENTRY_STORAGE__POSTGRES__URL`            | `[storage.postgres] url`             |
-| `SENTRY_CF_TOKEN`                          | Token Cloudflare (não no TOML)       |
-| `SENTRY_CF_ZONE`                           | Zone ID Cloudflare (não no TOML)     |
-| `SENTRY_LLM_KEY`                           | OpenRouter key (não no TOML)          |
-| `SENTRY_ANALYSIS__AI__LLM_PROVIDER`        | `[analysis.ai] llm_provider`         |
+Presets de feeds embutidos, expandidos em `feeds` na carga.
 
-## Segurança
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `feed_presets` | array de string | `[]` | Nomes válidos: `tor_exit`, `firehol_level1`, `proxy_list`, `open_source_vpn_ips`, `anti_vpn`. Feeds de preset **bloqueiam** por padrão; uma feed manual com o mesmo nome vence. |
 
-- Segredos (tokens Cloudflare, LLM, DB) **nunca** em config commitada. Via
-  env.
-- `sentry.example.toml` tem placeholders, não valores reais.
-- O `sensitive_paths` pack bloqueia `.env`, `.git/`, `.ssh/`, etc. por
-  default — ao expor uma rota allowlistada, justifique no PR.
+## [`[scorer]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L363)
 
-## Validação
+Pesos dos sinais e bônus de repetição.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `weights` | tabela `nome → inteiro` | `{}` | Sobrescreve o peso de um sinal pela chave snake_case (ex.: `sql_injection = 35`, `random_scan = 25`). |
+| `repetition_bonus` | bool | `true` | Bônus de score para sinais repetidos na janela deslizante. |
+| `repetition_window_secs` | inteiro | `60` | Duração da janela de repetição. |
+
+## [`[policy]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L395)
+
+Política de vereditos: mapeia nível de risco → veredito. Sobrescritas ordenadas via [`[[policy.override]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L431): a primeira expressão DSL que casar força o veredito.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `info` | string | `allow` | Veredito para eventos Info. |
+| `low` | string | `allow` | Veredito para eventos Low. |
+| `medium` | string | `rate_limit` | Veredito para eventos Medium. |
+| `high` | string | `challenge` | Veredito para eventos High. |
+| `critical` | string | `block` | Veredito para eventos Critical. |
+| `override` | array | `[]` | Cada entrada: `match` (DSL) e `verdict` (`allow` \| `rate_limit` \| `challenge` \| `block` \| `quarantine`). |
+
+```toml
+[[policy.override]]
+match = 'path ^/wp-admin$ AND NOT ip=10.0.0.0/8'
+verdict = "block"
+```
+
+## [`[escalation]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L458)
+
+Escalonamento de reincidentes: todo evento com veredito não-Allow registra 1 strike para o IP. Strikes só sobem o veredito, nunca baixam, e a janela deve sobreviver ao TTL da action de edge (o reincidente volta do TTL já re-bloqueado no primeiro evento violador).
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Liga o escalonamento por strikes. |
+| `window_secs` | inteiro | `604800` | Strikes expiram N segundos após a última violação (7 dias, maior que o TTL típico de 24h da edge). |
+| `challenge_at` | inteiro | `3` | Strikes para escalar para pelo menos `challenge`. |
+| `block_at` | inteiro | `5` | Strikes para escalar para `block`. |
+| `persist` | bool | `true` | Espelha strikes na tabela `ip_state` (Postgres) e pré-aquece o tracker no startup. |
+
+## [`[scan]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L507)
+
+Detecção comportamental de varreduras: janela deslizante por IP contando respostas 4xx — caminhos 4xx distintos → sinal `RandomScan`; total de 4xx → sinal `ScanBehavior`.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Liga os trackers de scan. |
+| `window_secs` | inteiro | `60` | Duração da janela deslizante. |
+| `distinct_paths` | inteiro | `8` | Caminhos 4xx distintos por IP que disparam `RandomScan`. |
+| `not_found` | inteiro | `10` | Total de 4xx por IP que dispara `ScanBehavior`. |
+
+## [`[behavior]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1136)
+
+Detecção comportamental de ataques de autenticação e diretório por janela deslizante por IP.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Liga os trackers de comportamento. |
+| `window_secs` | inteiro | `300` | Janela deslizante por IP. |
+| `auth_failures` | inteiro | `10` | Falhas 401/403 em rotas de login que disparam `AuthBruteForce`. |
+| `distinct_uas` | inteiro | `3` | User-Agents distintos falhando auth que disparam `CredentialStuffing`. |
+| `wordlist_hits` | inteiro | `5` | 404s em paths de wordlist que disparam `DirectoryBruteForce` (bons crawlers são isentos). |
+| `suspicious_success_min_failures` | inteiro | `3` | Falhas de auth que precisam preceder um 2xx em rota de login para disparar `SuspiciousLoginSuccess` (`0` desliga). |
+| `login_patterns` | array de string | `[]` | Substrings que identificam rotas de autenticação (vazio = lista embutida). |
+| `wordlist_paths` | array de string | `[]` | Paths conhecidos de probe (vazio = wordlist embutida). |
+
+## [`[correlation]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L548)
+
+Correlação scan→ataque cross-IP ("honeypot shot calling"): um ataque do IP B correlaciona com um scan de um IP **diferente** no mesmo /24 (IPv4), /64 (IPv6) ou ASN observado na janela → sinal `ScanAttackCorrelation` em B.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Liga o tracker de correlação. |
+| `window_secs` | inteiro | `900` | Idade máxima do scan para correlacionar (15 minutos). |
+
+## [`[rate_limit]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1283)
+
+Backend de rate-limit para condições DSL de rate (`RuleMatch::Rate`).
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `backend` | string | `memory` | `memory` (janela deslizante em processo, single-node) \| `redis` (multi-nó; exige o build feature `rate-redis`). |
+| `redis_url` | string | `redis://127.0.0.1/` | URL do Redis (usada só com `backend = "redis"`). |
+
+## [`[real_ip]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L626)
+
+Resolução do IP real do cliente, proxies confiáveis e conjuntos never-ban/never-allow.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `trusted_proxies` | array de string | `[]` | CIDRs/IPs de peers autorizados a setar headers de client IP (`CF-Connecting-IP`, `True-Client-IP`, `X-Real-IP`, XFF). Headers de outros peers são ignorados (anti-spoof). |
+| `cloudflare` | bool | `true` | Inclui as faixas Cloudflare embutidas (refresh diário de cloudflare.com/ips). |
+| `trusted_ips` | array de string | `[]` | Clientes nunca banidos/bloqueados/reportados (admins, uptime probes) — short-circuit do pipeline para `Allow`. |
+| `trusted_lists` | array de string | `[]` | Presets embutidos aprovados por nome (ex.: `paypal`, `stripe`, `googlebot`, `bingbot`) — entram no conjunto never-ban. |
+| `whitelist` | array de string | `[]` | Permite tudo, nunca bane — mesclado no mesmo conjunto never-ban. |
+| `blacklist` | array de string | `[]` | Nega imediatamente — o pipeline short-circuita para `Block` antes de qualquer detector. |
+| `shadow` | array de string | `[]` | Tráfego totalmente processado, mas o veredito é limitado (`Block`/`Quarantine` viram `Challenge`) — nunca bane. |
+| `refresh_secs` | inteiro | `86400` | Intervalo de refresh das faixas Cloudflare (`0` desliga; as constantes embutidas permanecem). |
+
+## [`[ip_lookup]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L696)
+
+Reputação externa on-demand: IPs na "banda cinza" (score local elevado sem veredito, ou carregando um sinal listado) são consultados no provedor e a confiança retornada re-entra no pipeline (só pode elevar o veredito). Consome cota da API — off por padrão.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Liga o fork de lookup. |
+| `provider` | string | `abuseipdb` | Provedor de reputação. |
+| `key_env` | string | `SENTRY_ABUSEIPDB_KEY` | Variável de ambiente com a chave da API. |
+| `trigger_above` | inteiro | `25` | Score local mínimo (0–100) para consultar (veredito ainda não-Block). |
+| `on_signals` | array de string | `[]` | Gatilho adicional: sinais (snake_case) que disparam o lookup. Vazio = só banda de score. |
+| `cache_ttl_secs` | inteiro | `86400` | TTL do cache de resultado por IP. |
+| `max_per_hour` | inteiro | `500` | Cota máxima de lookups por hora contínua. |
+| `timeout_secs` | inteiro | `10` | Timeout por requisição. |
+
+## [`[bot_verification]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L580)
+
+Verificação de bots via rDNS forward-confirmado: UAs que alegam ser crawlers verificáveis (Googlebot, bingbot, Slurp, Baiduspider, YandexBot) são validados com PTR nos domínios do engine + forward-resolve de volta ao IP. Bots verificados bypassam o challenge da edge; alegação falsa gera o sinal `SpoofedBot`. DNS roda fora do caminho quente. Inspecione com `sentry bots check <ip> --ua "Googlebot/2.1"`.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Liga a verificação (requer resolução DNS). |
+| `cache_ttl_secs` | inteiro | `3600` | TTL do resultado verificado, por IP. |
+| `failed_ttl_secs` | inteiro | `600` | TTL do resultado falsificado (curto, para bots recuperarem rápido de outage de DNS). |
+| `timeout_ms` | inteiro | `2000` | Timeout de uma rodada PTR+A. |
+| `batch_size` | inteiro | `16` | Máximo de claims verificadas por ciclo de drain. |
+
+## [`[ai]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1207)
+
+Modelo local clássico de anomalia (ONNX) rodando como fork assíncrono do pipeline; o re-score só pode elevar. Requer o build feature `onnx`. Treino: `sentry model export [--synthetic]` + `tools/train_model.py`.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Liga o estágio de modelo. |
+| `model_path` | string (caminho) | `models/anomaly_v1.onnx` | Arquivo do modelo ONNX. |
+| `threshold` | float | `0.7` | Probabilidade de anomalia que emite o sinal `AnomalousPayload` (0.0–1.0). |
+| `signal_weight` | inteiro | `25` | Peso do sinal emitido (sobrescrevível via `[scorer.weights]`). |
+| `mode` | string | `fork` | `fork` (assíncrono) \| `inline` (bloqueia antes das actions) \| `shadow` (só loga). |
+| `trigger` | string | `above_score` | `always` \| `above_score` \| `quarantine_only`. |
+| `min_score` | inteiro | `20` | Score mínimo do caminho quente para `trigger = "above_score"`. |
+| `concurrency` | inteiro | `4` | Inferências concorrentes máximas (modo fork). |
+| `cache_ttl_secs` | inteiro | `300` | TTL do cache de resultados por hash do payload. |
+
+## [`[llm]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1844)
+
+LLM opcional para re-score de eventos (chave via `SENTRY_LLM_KEY`). Espelha o comportamento do `[ai]`: fork/shadow, cache por hash do payload, só eleva o score.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `provider` | string | *(vazio)* | `openrouter` \| `openai` \| `ollama` \| `jev` \| `mock`. Vazio ou nome desconhecido desabilita o stage de LLM com um warning. |
+| `model` | string | *(vazio)* | ID do modelo específico do provedor (ex.: `meta-llama/llama-3.3-70b-instruct`); vazio usa o default do provider. |
+| `base_url` | string | *(vazio)* | Override de base URL (Ollama self-hosted / servidores compatíveis com OpenAI). |
+| `mode` | string | `fork` | `fork` (re-score assíncrono + re-dispatch de actions) \| `shadow` (loga a decisão, nunca age). |
+| `only_above` | inteiro | `30` | Só invoca o LLM acima deste score (ou em quarentena). |
+| `concurrency` | inteiro | `4` | Requisições LLM concorrentes máximas. |
+| `cache_ttl_secs` | inteiro | `300` | TTL do cache de vereditos por hash do payload. |
+
+## [`[edge]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1515)
+
+Edge inline (obrigatória com `[deployment] mode = "inline"`). Cadeia: client → sentry-edge → backend. O health check do upstream no startup é mandatório; vereditos aplicam antes do proxy (Block→403, RateLimit→429, Challenge→página de challenge). IPs bloqueados são negados por fast-path **antes** do pipeline e o bloqueio sobrevive a restarts.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `listen` | string | `0.0.0.0:80` | Endereço HTTP público. `listen = ""` desliga o listener plain (HTTPS-only). |
+| `upstream` | string | *(vazio)* | Base URL do backend protegido (ex.: `http://127.0.0.1:8080`). |
+| `health_path` | string | `/` | Path do health check obrigatório no startup. |
+| `health_timeout_secs` | inteiro | `5` | Timeout do health check. |
+| `body_capture_kb` | inteiro | `0` | Bytes do corpo capturados para inspeção, em KiB (`0` = off). |
+| `challenge_backend` | string | `sentry` | Quem executa vereditos Challenge: `sentry` (PoW embutido) \| `cloudflare` (vira regra CF via API; exige action com `provider = "cloudflare"`). |
+| `tls_cert` / `tls_key` | string (caminho) | *(vazio)* | Certificado e chave TLS (build feature `edge-tls`; ambos habilitam TLS). |
+| `tls_listen` | string | `0.0.0.0:443` | Bind HTTPS usado junto com `tls_cert`/`tls_key`; o `listen` plain continua de pé (80 e 443 monitorados). |
+| `tls_redirect_https` | bool | `false` | 301 de HTTP → HTTPS **depois** do pipeline (o tráfego da porta 80 segue monitorado/bloqueado). |
+| `tls_allowed_hosts` | array de string | `[]` | Hostnames aceitos no SNI do ClientHello; vazio desliga o check. SNI ausente/desconhecido pontua como probe (`TlsSniMismatch`). |
+| `tls_handshake_events` | bool | `true` | Emite um evento `TlsHandshake` por handshake (SNI + JA3 + JA4); mismatches são sempre emitidos. |
+| `tcp_listen` / `tcp_upstream` | string | *(vazio)* | Listener TCP inline para serviços não-HTTP (ex.: `0.0.0.0:2222` → `127.0.0.1:22`); veredito no connect. |
+| `forwarded_headers` | bool | `true` | Remove os `X-Forwarded-*`/`X-Real-IP` do cliente e seta a visão resolvida da edge (XFF = IP do cliente, proto, host). `false` restaura o pass-through. |
+| `http2` | bool | `true` | Negocia HTTP/2 no listener TLS (ALPN `h2` + `http/1.1`); `false` fixa HTTP/1.1. |
+| `upstream_connect_timeout_secs` | inteiro | `5` | Timeout de conexão do hop edge → upstream. |
+| `upstream_pool_idle` | inteiro | `32` | Conexões keepalive ociosas em pool por host de upstream. |
+| `max_concurrent_requests` | inteiro | `1024` | Máximo de requisições simultâneas (`0` = ilimitado); acima do teto, 503 imediato (error pages se aplicam). |
+
+```toml
+[edge]
+listen = "0.0.0.0:80"
+upstream = "http://127.0.0.1:8080"
+```
+
+### [`[edge.compress]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1618)
+
+Compressão de resposta da edge: negociação por `Accept-Encoding` (zstd > brotli > gzip) sobre corpos já bufferizados. Nunca comprime: respostas com `content-encoding`, 206, `no-transform`, corpos abaixo de `min_length` e content-types fora da allowlist. Sob pressão de overload desliga sozinha. zstd exige o build feature `edge-zstd`.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Liga a compressão. |
+| `min_length` | inteiro | `256` | Corpos menores passam intocados. |
+| `level_br` | inteiro | `4` | Qualidade brotli 0..=11. |
+| `level_gzip` | inteiro | `6` | Nível gzip 0..=9. |
+| `level_zstd` | inteiro | `3` | Nível zstd 1..=22 (só com `edge-zstd`). |
+
+### [`[edge.challenge]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1699)
+
+Challenge interativo SHA-256 proof-of-work para vereditos Challenge (usado com `challenge_backend = "sentry"`). Stateless: compartilhe o segredo entre nós da edge. PoW nunca destrava um Block; crawlers verificados por rDNS bypassam.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Liga o challenge interativo. |
+| `secret_env` | string | `SENTRY_EDGE_CHALLENGE_SECRET` | Env com o segredo compartilhado (recomendado 32+ bytes aleatórios); **obrigatório** quando habilitado — sem ele o startup falha. |
+| `bucket_secs` | inteiro | `3600` | Duração do bucket — challenge rotaciona e cookies expiram com ele. |
+| `difficulty` | inteiro | `16` | Bits zero à esquerda do PoW (clampado 8..=28). |
+| `title` | string | `Verifying your browser...` | Título da página interstitial. |
+| `template_path` | string (caminho) | *(vazio)* | HTML alternativo da interstitial — re-lido a cada render (edita sem restart); precisa manter os marcadores `{{…}}` obrigatórios. |
+
+### [`[edge.error_pages]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1686)
+
+Páginas de erro HTML customizadas para toda resposta gerada pela edge.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `dir` | string (caminho) | *(vazio)* | Diretório com `<status>.html` (ex.: `403.html`, `413.html`, `429.html`, `502.html`) + `default.html` opcional. Placeholders `{{SENTRY_STATUS}}`, `{{SENTRY_TITLE}}`, `{{SENTRY_MESSAGE}}`, `{{SENTRY_TRACE_ID}}`, `{{SENTRY_ICON}}`; valores escapados. Lidas uma vez no startup (arquivos > 256 KiB são ignorados com warning). |
+
+## [`[uploads]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L841)
+
+Inspeção de corpo e uploads (só faz sentido inline): corpos são bufferizados, multipart/urlencoded/JSON parseados e os heurísticos de upload pontuam o que encontrarem (SQLi/XSS em filenames e campos, imagens poliglotas, executáveis disfarçados, flood). O teto de memória é ~requisições concorrentes × `inspect_kb`.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Liga a inspeção de uploads (exige modo inline). |
+| `mode` | string | `shadow` | [`shadow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L916) (detecta + loga, sinais com peso 0) \| `enforce` (pesos plenos, bloqueia antes do upstream). |
+| `inspect_kb` | inteiro | `4096` | Teto de inspeção por requisição em KiB. |
+| `max_files` | inteiro | `16` | Máximo de partes multipart parseadas por requisição. |
+| `scan_json` | bool | `true` | Escaneia corpos JSON como texto (SQLi/XSS em payloads de API). |
+| `blocked_extensions` | array de string | `php, phtml, php5, jsp, jspx, asp, aspx, exe, dll, sh, bat, ps1` | Extensões que sempre geram `UploadExecutable` (inclui dupla extensão `shell.php.jpg`). |
+| `allowed_extensions` | array de string | `[]` | Allowlist: quando não-vazia, extensão (ou dupla) fora da lista gera `UploadDisallowed`; arquivos sem extensão não são afetados; `blocked_extensions` vence. |
+| `oversize` | string | `reject` | [`reject`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L810) (413) \| `skip` (encaminha sem inspecionar) \| `flag` (encaminha + sinal `UploadOversize` e conta no flood). Corpos maiores que `inspect_kb`. |
+
+### [`[uploads.flood]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L944)
+
+Limites de volume do flood de uploads por IP.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `window_secs` | inteiro | `60` | Duração da janela deslizante por IP. |
+| `max_uploads` | inteiro | `30` | Arquivos por IP na janela que disparam `UploadFlood` (`0` = off). |
+| `max_total_mb` | inteiro | `50` | Total de MiB enviados por IP na janela que disparam `UploadFlood`. |
+
+## [`[posture]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L985)
+
+Advisories de postura de segurança web (só inline): respostas do upstream são checadas por headers de segurança ausentes/fracos (CSP, HSTS, COOP, frame protection, Trusted Types, nosniff, referrer policy). Findings viram sinais de peso 0 — nunca mudam score nem veredito, e nem `[scorer.weights]` muda isso.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Liga os advisories (impacto de enforcement zero). |
+| `mode` | string | `shadow` | [`shadow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1110) (só reporta) \| `enforce` (reservado para injeção de headers — roadmap; **rejeitado na carga**). |
+| `dedupe_ttl_secs` | inteiro | `3600` | Período de dedupe por (host, check) antes de re-reportar. |
+| `hsts_min_max_age` | inteiro | `31536000` | `max-age` do HSTS abaixo do qual o header conta como fraco (1 ano). |
+| `checks` | array de string | `[]` (todas) | Ids habilitados: `csp`, `hsts`, `coop`, `clickjacking`, `trusted_types`, `nosniff`, `referrer_policy`. Lista explícita substitui o conjunto inteiro. |
+| `hosts` | array de string | `[]` | Restringe os advisories a estes Hosts (vazio = qualquer; teto de 64 hosts). |
+
+## [`[protocol]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L762)
+
+Validação de protocolos: compila schemas YAML (`*.protocol.yaml`) e valida frames em portas não padrão na edge-tcp. Hot-reload ao vivo do diretório; compile falho mantém o set anterior.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Liga o validador de protocolos. |
+| `dir` | string (caminho) | `schemas` | Diretório observado (add/modify/remove ao vivo). |
+| `safety_poll_secs` | inteiro | `60` | Rescan de segurança que cobre perdas de fs-events. |
+| `debounce_ms` | inteiro | `500` | Janela de coalescência dos fs-events antes do rescan. |
+| `max_schemas` | inteiro | `64` | Máximo de schemas compilados aceitos do diretório. |
+
+## [`[metrics]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1311)
+
+Métricas Prometheus: serve `/metrics` e `/api/events` (eventos recentes, para o dashboard Grafana) no mesmo processo do daemon. Sem auth — mantenha a porta interna.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Liga o endpoint `/metrics`. |
+| `host` | string | `0.0.0.0` | Bind do servidor de métricas. |
+| `port` | inteiro | `9100` | Porta do servidor de métricas. |
+
+## [`[server]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1345)
+
+Dashboard web e API JSON (`sentry serve`) — processo separado do daemon; requer Postgres.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `host` | string | `127.0.0.1` | Bind do servidor. Com auth desligada só loopback é seguro. |
+| `port` | inteiro | `8080` | Porta do servidor. |
+| `auth` | tabela | — | Subtabela [`[server.auth]`](#serverauth) abaixo. |
+| `webhook_secret_env` | string | `SENTRY_WEBHOOK_SECRET` | Env com o segredo compartilhado: requisições com o header `X-Sentry-Webhook-Secret` correspondente podem ack/resolver incidentes. |
+
+### [`[server.auth]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1419)
+
+Auth + RBAC do dashboard/API.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `mode` | string | `none` | `none` \| `password` \| `token` \| `both`. Papéis: `admin` (mutações) e `viewer` (leitura). |
+| `users` | array | `[]` | Usuários do dashboard (modo password), cada um com [`username`, `password_hash` (Argon2id via `sentry auth hash-password`), `role`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1386) (default `viewer`). |
+| `tokens` | array | `[]` | API tokens estáticos (modo token), cada um com [`token_sha256` **ou** `token_env` + `role`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1401) (default `viewer`; hash via `sentry auth token-hash`). |
+| `session_secret_env` | string | `SENTRY_SESSION_SECRET` | Env com a chave HMAC de assinatura dos cookies de sessão. |
+| `session_ttl_secs` | inteiro | `43200` | Vida útil do cookie de sessão (12h). |
+
+## [`[[action]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2074)
+
+Ações de resposta. Cada entrada tem [`type`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2103), `provider` opcional, `dispatch` opcional e um mapa `options` do plugin.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `type` | string | `log` | Discriminador type-safe: `cloudflare` (alias de challenge + CF) \| `challenge` \| `webhook` \| `blocklist` \| `report` \| `log`. Typo falha na carga. |
+| `provider` | string | *(vazio)* | Só para `type = "challenge"`: `cloudflare` \| `firewall` \| `nginx` \| `opnsense` \| `pfsense` \| … (extensível via trait `ChallengeProvider`). |
+| `dispatch` | string | *(default natural)* | `inline` (contenção local, no hot loop) \| `deferred` (I/O de rede nos workers). Defaults: blocklist/log/firewall = inline; cloudflare/nginx/opnsense/pfsense/webhook/report = deferred. |
+| `options` | tabela | `{}` | Opções específicas do plugin (abaixo). |
+
+**`type = "blocklist"`** — blocklist em memória que alimenta a block table compartilhada; os mesmos blocks são espelhados em `ip_state` (visível no dashboard, restart-safe).
+
+| Option | Padrão | Descrição |
+| --- | --- | --- |
+| `ttl_secs` | `86400` | TTL dos bloqueios de pipeline de ponta a ponta. |
+
+**`type = "challenge"`, `provider = "cloudflare"`** — aplica vereditos como regras na Cloudflare (env: `SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`, opcional `SENTRY_CF_ACCOUNT`).
+
+| Option | Padrão | Descrição |
+| --- | --- | --- |
+| `mode` | `managed_challenge` | `block` \| `js_challenge` \| `managed_challenge` \| `rate_limit`. |
+| `ttl_secs` | `86400` | TTL das regras de acesso (comentadas como `sentry:<ts>:<ttl>` para o reaper). |
+| `max_failures` | `3` | Circuit breaker: desativa o provider após N falhas consecutivas (até restart). |
+| `ipv6_prefix` | *(vazio)* | 1..=128 — bloqueia IPv6 por /64 via IP List account-level (`ip.src in $<list_name>`); ausente/128 mantém regras de endereço exato. |
+| `list_name` | `sentry_blocks` | Nome da IP List (`^[a-z0-9_]+$`, máx 50 chars). |
+
+**`provider = "firewall"`** — bans de kernel (Linux only; auto-detect nftables → ipset+iptables → firewalld; requer root ou `CAP_NET_ADMIN`).
+
+| Option | Padrão | Descrição |
+| --- | --- | --- |
+| `backend` | `auto` | `auto` \| `nftables` \| `ipset` \| `firewalld`. |
+| `ttl_secs` | `86400` | Duração dos bans Block/Challenge. |
+| `rate_limit_ttl_secs` | `600` | TTL menor para vereditos RateLimit. |
+| `table` | `sentry` | Nome da tabela nftables. |
+| `set_prefix` | `sentry_blocks` | Prefixo dos sets (`sentry_blocks_v4` / `sentry_blocks_v6`). |
+
+**`provider = "nginx"`** — gera includes de deny/challenge em um nginx co-localizado e recarrega (funciona com o Sentry em modo passive).
+
+| Option | Padrão | Descrição |
+| --- | --- | --- |
+| `conf_dir` | — (obrigatório) | Diretório dos includes gerados (`sentry-deny.conf`, `sentry-challenge.conf`, …). |
+| `reload_cmd` | `nginx -s reload` | Comando de reload (sem shell). |
+| `validate` | `true` | Roda `nginx -t` antes de cada reload. |
+| `ttl_secs` | `86400` | TTL dos denies (stamps `# sentry:<ts>:<ttl>`). |
+| `rate_limit_deny` | `false` | Também nega vereditos RateLimit. |
+| `provision_bots` | `true` | Emite o snippet `bot_verifier` (módulo opt-in). |
+| `geo_var` | `$sentry_challenge_ip` | Variável geo do map de challenge. |
+
+**`provider = "opnsense"` / `provider = "pfsense"`** — drops no appliance de firewall (plataforma drop-only: Challenge/RateLimit são logados como unenforced).
+
+| Option | Padrão | Descrição |
+| --- | --- | --- |
+| `base_url` | — (OPNsense, obrigatório) | Base URL da API REST do OPNsense. |
+| `api_key_env` / `api_secret_env` | `SENTRY_OPN_API_KEY` / `SENTRY_OPN_API_SECRET` | Envs com as credenciais (OPNsense). |
+| `table` | `sentry_blocks` | Alias/table dos bans. |
+| `pfctl_path` | `pfctl` | Binário pfctl (backend pfSense). |
+| `accept_invalid_certs` | `true` | Aceita certificado self-signed do appliance. |
+| `ipv6_prefix` | *(vazio)* | Entradas IPv6 como CIDR (sem isso, endereço exato). |
+
+**`type = "report"`** (`provider = "abuseipdb"` \| `"reportedip"`) — reporta IPs com veredito de enforcement para bancos de abuse comunitários.
+
+| Option | Padrão | Descrição |
+| --- | --- | --- |
+| `key_env` | default do provider (ex.: `SENTRY_ABUSEIPDB_KEY`) | Env com a chave da API; chave ausente pula a action com warning. |
+| `min_verdict` | `block` | Veredito mínimo reportado: `block` \| `challenge` \| `rate_limit`. |
+| `dedupe_hours` | `24` | Um report por IP por janela. |
+| `timeout_secs` | `10` | Timeout por requisição. |
+
+**`type = "webhook"`** — POST JSON de alerta (Discord recebe embed rico automaticamente).
+
+| Option | Padrão | Descrição |
+| --- | --- | --- |
+| `url` / `url_env` | — (um dos dois é obrigatório) | URL do webhook; prefira `url_env` (a URL é credencial). `url_env` vazio pula a action com warning. |
+| `on_levels` | `["high", "critical"]` | Níveis de risco que disparam o POST. |
+| `timeout_secs` | `10` | Timeout do POST. |
+| `secret_env` | `SENTRY_WEBHOOK_SECRET` | Quando a env existe, requisições são assinadas com `X-Sentry-Signature: sha256=<hmac>` e o payload carrega `incident_id`/`ack_url` para callback. |
+
+**`type = "log"`** — embutida, emite linha de tracing no act.
+
+```toml
+[[action]]
+type = "challenge"
+provider = "cloudflare"
+[action.options]
+mode = "managed_challenge"
+ttl_secs = 86400
+max_failures = 3
+ipv6_prefix = 64
+```
+
+## Validação e segredos
 
 ```bash
-sentry config validate     # valida schema, paths, actions
-sentry config show         # mostra config efetiva (com overlay resolvido)
+sentry config validate   # valida schema, regras DSL e schemas de protocolo
+sentry config show       # imprime a config resolvida (com overlay aplicado)
 ```
+
+`sentry config validate` compila as regras custom (a DSL é parseada na carga), compila os schemas de protocolo quando `[protocol] enabled`, **rejeita** `[posture] mode = "enforce"` (ainda roadmap), avisa sobre ids desconhecidos em `[posture] checks` e imprime os advisories de topologia/performance da edge (TLS duplo, upstream http fora do loopback, compressão inerte fora do inline).
+
+Regras de segurança:
+
+- Segredos (tokens Cloudflare/LLM/DB, chaves de API, segredos de sessão) **nunca** em config commitada — via env (`SENTRY_*`).
+- `sentry.example.toml` tem placeholders, não valores reais.
+- O pack `sensitive_paths` bloqueia `.env`, `.git/`, `.ssh/`, etc. por padrão — ao expor uma rota allowlistada, justifique no PR.

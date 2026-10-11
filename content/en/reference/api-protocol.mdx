@@ -1,0 +1,167 @@
+---
+title: "API — sentry-protocol"
+description: "Reference for sentry-protocol: protocol schema DSL, compiler, VM, DoS guards and CLI"
+---
+
+# API — `sentry-protocol`
+
+[`sentry-protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/lib.rs#L1) describes and validates **non-HTTP protocols on non-standard ports** (F9). A YAML schema describes framing, dispatch by header, field reads and constraints; the crate compiles it into an instruction table executed by a small register VM — **zero regex on the default path** (the one regex an schema may declare is compiled at load, linear-time). The crate is pure: no I/O, no async, no dependency on other Sentry crates (`#![forbid(unsafe_code)]`); the host (daemon/edge) owns file loading, hot-reload watchers and converts [`Violation`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/lib.rs#L71)s into pipeline signals.
+
+## Schema model — module `schema`
+
+### ProtocolSchema
+
+```rust
+pub struct ProtocolSchema {
+    pub id: String,
+    pub mode: Mode,
+    pub transport: Transport,
+    pub on_message: Option<OnMessage>,
+    pub types: BTreeMap<String, TypeDef>,
+    pub policies: BTreeMap<String, Policy>,
+    pub messages: BTreeMap<String, MessageDef>,
+}
+```
+
+[`ProtocolSchema`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/schema.rs#L43) is the root (`deny_unknown_fields` — a wrong key is a load error). The `id` becomes the label on metrics and signals.
+
+### Transport and Mode
+
+```rust
+pub struct Transport {
+    pub protocol: TransportKind,   // tcp | udp | ws
+    pub ports: Vec<u16>,
+    pub flags: BTreeMap<String, String>,
+}
+```
+
+[`Transport`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/schema.rs#L93) declares the port(s) the schema guards — the host wires by port. [`TransportKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/schema.rs#L107) accepts `tcp`, `udp` and `ws`. [`Mode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/schema.rs#L82) sets the posture: `shadow` (default) only signals and logs; `enforce` authorizes the host to close the connection on the first violation.
+
+### types — read macros defined per protocol
+
+The crate only ships universal atoms; protocol-specific formats (variable-length integers, custom-prefixed strings) are defined in the schema itself, as a [`TypeDef`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/schema.rs#L126), in three forms:
+
+- **One-liner sugar** ([`SugarRead`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/schema.rs#L178)): `{prefix/fixed/terminator, endian, decode, max_len, mask_ok, range_ok, len_ok, regex, in/not_in, req, charsets}` — desugared into steps at load.
+- **Step body**: a register mini-machine with **infix expressions** (`acc: "(b0 and 0x38) >> 3"`; word ops `and/or/xor/shl/shr/add/sub/mul/not` + symbolic sugar `& | ^ << >> + - *`), I/O `read`/`decode`/`peek`, `while min!(expr, cap):` with a compile-time-provable bound, `if <expr>:` with a forward-only block, the statement macros `check_mask!/check_range!/check_len!` and `return <reg>`.
+- **Composite**: a list of sequential reads into named sub-fields.
+
+Type-in-type nesting is capped at 8 levels (`MAX_TYPE_DEPTH`).
+
+### messages and policies
+
+`messages` is the dispatch table: `when` is mandatory (the union of `when`s is an implicit allowlist — overlap is a load error), `after: [msg]` (sequencing), `policy` (cited severity), `keepalive {cadence, rate_limit}` and `validate` (per-field constraint one-liners). `policies` names severities: `default` is mandatory; each policy has a `weight` and `on_repeat {count, window, escalate}` for repeat escalation.
+
+## Compiler — module `compile`
+
+### Compiled
+
+```rust
+pub struct Compiled {
+    pub protocols: Vec<CompiledProtocol>,
+    /* by_port: HashMap<u16, usize> */
+}
+pub fn add(&mut self, schema: ProtocolSchema, opts: &CompileOptions) -> Result<(), ProtocolError>;
+pub fn for_port(&self, port: u16) -> Option<&CompiledProtocol>;
+```
+
+[`Compiled`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L38) is the compiled set, swappable as a single `Arc` per reload. [`add`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L47) compiles one schema and registers its ports (the first schema claiming a port wins); [`for_port`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L61) is the host lookup. [`CompileOptions`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L31) injects datasets for `not_in` ops.
+
+### CompiledProtocol, FrameSpec and MessageProgram
+
+Each [`CompiledProtocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L86) carries the id, mode, ports, preamble (the `on_message.run` pipeline), per-message programs, the dispatch table (`when` by header becomes a HashMap; the rest is linear) and the named policies ([`PolicySpec`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L111): weight + `on_repeat` window). [`MessageProgram`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L120) holds the label, the name hash (`after` bookkeeping), the policy, prerequisites and the straight-line [`Instr`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/instr.rs#L95) program. Custom macros desugar into the same `Vec<Instr>` — inlining, zero runtime cost.
+
+When the schema uses `check_len!`, the compiler captures the framing into [`FrameSpec`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L69) (offset, prefix, endian, what the length covers, cap) — the host uses it to split the TCP stream into frames **before** calling the VM. The entry point is [`compile_schema`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/compile.rs#L260).
+
+## VM — module `engine`
+
+### ProtocolEngine
+
+```rust
+pub struct ProtocolEngine { /* ArcSwap<Compiled> */ }
+pub fn new(compiled: Compiled) -> Self;
+pub fn swap(&self, compiled: Compiled);      // hot reload: 1 pointer swap
+pub fn current(&self) -> Arc<Compiled>;
+pub fn feed(&self, proto: &CompiledProtocol, state: &mut ConnectionState, bytes: &[u8]) -> Result<FrameInfo, Vec<Violation>>;
+```
+
+[`ProtocolEngine`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/engine.rs#L22) wraps the set in an `ArcSwap`: a reload is one atomic swap with zero downtime — in-flight frames finish on the previous program. [`feed`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/engine.rs#L115) validates **one complete frame** (framing is the host's job) and returns a [`FrameInfo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/engine.rs#L102) or the violation list (always ≥ 1). [`feed_on`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/engine.rs#L53) is the free function for hosts holding their own compiled snapshot.
+
+### ConnectionState
+
+Per-connection state, lock-free, owned by the connection's task ([`ConnectionState`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/engine.rs#L63)): a message seen-set (validates `after`), keepalive windows and per-policy repeat counters (validate `on_repeat`). [`is_stale`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/engine.rs#L90) lets the host prune dead connections.
+
+### Guards against DoS
+
+Hard budgets enforced at compile time and runtime:
+
+- **16 registers** per protocol ([`MAX_REGS`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/instr.rs#L314)); op/atom names are reserved.
+- **512 instructions** per compiled message ([`MAX_INSTRS_PER_MESSAGE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/lib.rs#L88)).
+- `while` requires a compile-time-provable bound (`min!(expr, cap)`); iterations clamp; `if` is a forward-only branch — termination is guaranteed.
+- Type nesting ≤ 8; size caps on every prefixed/terminated read (`max_len`, `FrameSpec.max`).
+
+## Errors — module `error`
+
+[`ProtocolError`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/error.rs#L11) covers the whole cycle, each variant naming the schema at fault: `Yaml` (invalid document), `Schema` (violates DSL rules), `Parse` (malformed one-liner or step), `Compile` (duplicate `when`, unknown type/macro, register misuse) and `MissingDataset` (a `not_in` dataset not provided by the host).
+
+## Expressions and instructions
+
+[`expr`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/expr.rs) is the Pratt parser for the infix expressions (negative literals fold at compile time); [`instr`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/instr.rs#L95) defines the VM instructions over [`Value`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/instr.rs#L15) (Bytes/Str/Int). Benchmarks: a compiled frame runs ~0.68 µs vs a ~20.8 µs regex baseline (~30×); `read_until` with memchr 27 ns vs 1.10 µs scalar (~41×).
+
+## The `simd` feature
+
+`sentry-protocol` has an optional `simd` feature ([`Cargo.toml`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/Cargo.toml#L15)): terminator scans via `memchr` and UTF-8 validation via `simdutf8` — pure-Rust crates with scalar fallbacks. On by default for the daemon; turn it off to force the scalar path. The `simd_vs_scalar` comparison bench runs in the same executable with always-present dev-deps.
+
+## CLI
+
+```bash
+sentry protocol validate [--dir <path>]   # compiles every *.protocol.yaml in dir
+sentry protocol list    [--dir <path>]    # id, ports, mode, messages
+sentry protocol check <schema> --hex <bytes>  # test real bytes against the schema
+```
+
+Implemented in [`protocol_cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/protocol_cmd.rs#L9): `compile_dir` loads and compiles the directory (all-or-nothing per file). The hot-reload watcher (`notify`, debounce + coalescing + safety poll) and the `[protocol]` config (`enabled`, `dir`, `max_schemas`) live in the daemon; `sentry config validate` also compiles the schemas.
+
+## Example
+
+An excerpt of the [`game-relay.protocol.yaml`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/tests/fixtures/game-relay.protocol.yaml) fixture — a legacy binary protocol with a big-endian length prefix, schema-defined types and an escalating policy:
+
+```yaml
+transport:
+  protocol: tcp
+  ports: [14901]
+
+on_message:
+  run: "check_len! | parse_header!"
+
+types:
+  LPStr: {prefix: u16, decode: utf8, max_len: 1024}
+  VLInt:
+    body:
+      - b0: "read u8"
+      - n: "(b0 and 0x38) >> 3"
+      - acc: "b0 and 0x03"
+      - while min!(n, 4):
+          - bi: "read u8"
+          - check_mask!(bi, 0xC0, 0x40)
+          - acc: "(acc << 6) or (bi and 0x3F)"
+      - if sign:
+          - acc: "-acc"
+      - return acc
+
+policies:
+  default: {weight: 20}
+  unknown_header:
+    weight: 35
+    on_repeat: {count: 3, window: 60s, escalate: true}
+
+messages:
+  sso_ticket_event:
+    when: {header: 400}
+    validate:
+      - sso_ticket: LPStr >2 <64 regex 'GAME-[a-zA-Z0-9]+-3324'
+  ping_event:
+    when: {header: 4096}
+    keepalive: {cadence: 30s, rate_limit: 2/60s}
+```
+
+The [`chat-relay.protocol.yaml`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/tests/fixtures/chat-relay.protocol.yaml) fixture shows the same DSL over WebSocket with a JSON payload — no custom macros needed, `validate` ops apply to the decoded text fields.

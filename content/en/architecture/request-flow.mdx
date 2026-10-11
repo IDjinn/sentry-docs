@@ -1,85 +1,149 @@
 ---
 title: "Request Flow"
-description: "Sequence of stages from log to action"
+description: "Pipeline stages from ingest to action — passive and inline edge"
 ---
 
 # Request Flow
 
-When an access log line arrives, Sentry normalizes it into an `Event`, sends
-it to the pipeline, which fans out in parallel to heuristics, AI and the route
-validator. Results converge in the scorer, producing an `AnalysisResult`. The
-decider applies policy and dispatches to actions.
+Sentry operates in two ingestion modes, set by `[deployment] mode`:
 
-<Mermaid chart={`
+- **Passive** (default): read-only sources tail logs / receive syslog /
+  capture packets. The pipeline analyzes the event and actions react
+  (block on Cloudflare/firewall, webhook, …) — the request already
+  happened.
+- **Inline** (`sentry-edge`): Sentry is the reverse proxy in front of the
+  application. Each request goes through the **same** `Arc<Pipeline>`
+  **before** the upstream; the verdict decides whether it proceeds (and
+  the response phase is re-observed — see below).
+
+```mermaid
+flowchart TD
+    SRC["Source (tail/syslog/pcap/CF/edge)"]
+    DD{"LRU dedupe\nTTL dedupe_ttl_secs"}
+    TR{"Trusted or\nblacklisted IP?"}
+    BOT["Bot rDNS verification (annotates)"]
+    RULES["Rules engine\nAllow > Block/Challenge/RateLimit > Log/Tag"]
+    HEUR["Heuristics\nURL-decode + Aho-Corasick prefilter"]
+    REP["Reputation signals (feeds)"]
+    ROUTE["Route validation\nUnknownRoute / MethodNotAllowed"]
+    PEND["Drain pending response-phase\nsignals (F3.9.1)"]
+    TRACK["Trackers: scan, behavior, upload flood"]
+    CORR["Cross-IP scan→attack correlation"]
+    SCORE["Scorer: weight sum + repetition\ncap 100"]
+    POL["Policy override\n[[policy.override]]"]
+    ESC["Repeat-offender escalation\nstrikes → challenge/block"]
+    FORK["Async forks: ONNX AI, LLM, ip_lookup\nrescore_from — only raises"]
+    DEC["Decision → actions"]
+    LANE["Lanes: inline (local containment)\nor deferred (network workers)"]
+    PERS["Batched persistence\n+ overload sampling"]
+
+    SRC --> DD --> TR
+    TR -->|"otherwise"| BOT --> RULES
+    RULES -->|"short-circuit"| DEC
+    RULES -->|"Log/Tag: continue"| HEUR --> REP --> ROUTE --> PEND --> TRACK --> CORR --> SCORE --> POL --> ESC --> DEC
+    DEC -.->|"re-score"| FORK -.-> DEC
+    DEC --> LANE --> PERS
+```
+
+## Stages in detail
+
+1. **Ingest + dedupe** — the daemon loop drains the fan-in in batches
+   (`recv_many(64)`) and consults an LRU keyed by the event's `u64` hash;
+   identical GETs within `dedupe_ttl_secs` (10 s) die before the pipeline.
+   See [`daemon.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs).
+2. **Trust guards** ([`trust.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/trust.rs)) —
+   IPs in `trusted_ips` (never-ban) get an immediate Allow; IPs on the
+   `blacklist` are blocked before any detector runs.
+3. **Bot verification** ([`botverify.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs), F7.7) —
+   a UA claiming to be a crawler is annotated with the cached rDNS outcome
+   (verified → challenge bypass; spoofed → `SpoofedBot` signal).
+4. **Rules engine** ([`rules.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs), [`packs.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs)) —
+   fast path. Precedence: `Allow` (full bypass) > `Block`/`Challenge`/
+   `RateLimit` (short-circuit) > `Log`/`Tag` (annotate and continue).
+   Default packs: `sensitive_paths`, `honeypot_paths`, `crawlers_bad`,
+   `crawlers_good`, `empty_ua`, `http_anomaly`, `vpn_proxy`, `tor`,
+   `rate_scan`, `country_blocklist`, `host_allowlist`.
+5. **Heuristics** ([`heuristics.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs)) —
+   SQLi/XSS/path traversal/LFI/Log4Shell/cmd injection/sensitive path/bad
+   crawler/empty UA + upload detectors (F10). They run over URL-decoded
+   text (`http_text`) behind an Aho-Corasick prefilter: clean traffic
+   executes **zero regex**.
+6. **Reputation** ([`reputation.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs)) —
+   `TorExitNode`, `KnownBadIp`, `VpnProxy`, `PromiscuousScanner` from the
+   synced feeds (F3.7).
+7. **Routes** (validator in
+   [`pipeline.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs)) —
+   a path outside the allowlist (config ∪ DB) → `UnknownRoute`; a
+   disallowed method → `MethodNotAllowed`. Supports exact paths, globs
+   `/api/*` and templates `/users/{id}`.
+8. **Response phase** (F3.9.1) — status-gated signals (4xx windows) only
+   exist after a response. In inline mode,
+   [`Pipeline::observe_response`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L737)
+   feeds the trackers the real status (upstream or the edge's own
+   403/429/301) and queues the raised signals (TTL 60 s, cap 16/IP); the
+   next request from the same IP drains them into scoring. Without this,
+   scanners over inline traffic would stay at Allow forever.
+9. **Behavior trackers** —
+   [`ScanTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/scan.rs)
+   (≥ 8 distinct 4xx paths → `RandomScan`; ≥ 10 4xx → `ScanBehavior`),
+   [`BehaviorTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/behavior.rs)
+   (auth brute-force, credential stuffing, directory brute-force,
+   suspicious login success) and the
+   [`UploadTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/uploads.rs)
+   (volume flood, F10).
+10. **Correlation** ([`correlation.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/correlation.rs), F3.10) —
+    a scan from one IP + an attack from **another** IP in the same /24,
+    /64 or ASN within the window → `ScanAttackCorrelation`.
+11. **Scorer + policy + escalation** — weighted sum (cap 100) with a
+    repetition bonus, the
+    [`VerdictPolicy`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/policy.rs)
+    (level→verdict mapping + DSL overrides) and the
+    [`OffenderTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/offender.rs)
+    (strikes raise the verdict). Details in
+    [Risk Levels](/en/architecture/risk-levels).
+12. **Async forks** — the ONNX model, the LLM and the external IP lookup
+    run off the hot path and re-enter via
+    [`rescore_from`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L1005):
+    they can only ever **raise** the score/verdict, never lower it.
+    Never-ban IPs are immune.
+13. **Actions in two lanes** (F5) — local containment (blocklist, log,
+    kernel firewall) runs inline in the ingest loop; network actions
+    (Cloudflare, nginx, OPNsense, webhook, report) go to deferred workers.
+    Under overload the action queue fills first: **actions** are shed,
+    never events (`sentry_action_queue_drops_total`).
+14. **Persistence** — a dedicated worker writes in batches (one
+    multi-INSERT per `recv_many`); security events fall back to a direct
+    write when the queue is full; benign events are coalesced/sampled
+    under pressure. See [Performance](/en/architecture/performance).
+
+## Inline edge: what changes
+
+In inline mode the request enters the edge **before** the upstream:
+
+```mermaid
 sequenceDiagram
-    participant N as Nginx (log)
-    participant I as Ingestor
+    participant C as Client
+    participant E as sentry-edge
     participant P as Pipeline
-    participant H as Heurísticas
-    participant A as IA (ONNX)
-    participant R as Roteiro (rotas válidas)
-    participant S as Scorer
-    participant D as Decisor
-    participant CF as Cloudflare API
-    participant DB as SQLite
+    participant U as Upstream
 
-    N->>I: linha de access_log
-    I->>I: parse + normalizar p/ Event
-    I->>P: Event
-    par fan-out paralelo
-        P->>H: regex/sigs (SQLi, XSS, LFI...)
-        P->>A: payload suspeito? embeddings
-        P->>R: path existe? método permitido?
-    end
-    H-->>S: signals + pesos
-    A-->>S: score anomalia
-    R-->>S: -delta se rota inválida
-    S->>S: combinar → risk_score + level
-    S->>D: AnalysisResult
-    D->>D: aplicar política (ex: High+IP novo = Challenge)
-    alt Decision == Block
-        D->>CF: firewall_rules: block IP
-        D->>DB: registrar incidente
-    else Decision == Challenge
-        D->>CF: challenge IP (JS/Turnstile)
-    else Allow
-        D->>DB: métricas only
-    end
-    D-->>N: (não interfere no nginx na fase 1; modo inline no futuro)
-`} />
+    C->>E: request
+    E->>E: BlockTable fast-path (403, no event)
+    E->>E: challenge gate (PoW / Cloudflare delegation)
+    E->>E: body inspection (uploads, F10)
+    E->>P: Event (request phase, status still None)
+    P-->>E: verdict (Allow proceeds, else 403/429/challenge)
+    E->>U: proxy the request
+    U-->>E: response
+    E->>P: observe_response (real status → 4xx trackers)
+    E->>E: compression (if negotiated)
+    E-->>C: response
+```
 
-## Valid route detection
-
-1. **Controlled discovery**: the user supplies valid routes via config
-   (allowlist) **or** Sentry learns in `learn` mode (a baseline period with
-   no attacks).
-2. Structure: a trie of paths with allowed methods + expected parameters.
-3. Derived signals:
-   - Non-existent route → +points (scan/directory brute-force).
-   - Many 404s from the same IP within a window → scan behavior.
-   - Hits on sensitive paths (`/.env`, `/wp-admin`, `/api/admin`) even when
-     non-existent → high weight.
-4. Output: a `sentry routes` report showing known vs. attempted routes.
-
-## Cloudflare integration (challenge synergy)
-
-<Mermaid chart={`
-flowchart LR
-    EVT[Evento High/Critical] --> CF1{Cloudflare habilitado?}
-    CF1 -->|sim| CF2[Resolver zona+IP]
-    CF2 --> CF3{Já bloqueado recentemente?}
-    CF3 -->|não| CF4[Criar/Atualizar firewall rule]
-    CF3 -->|sim| CF5[Estender TTL]
-    CF4 --> CF6["Challenge mode: js_challenge / managed_challenge / block"]
-    CF6 --> CF7[Webhook confirmação]
-    CF1 -->|não| BL[Blocklist local only]
-`} />
-
-- Tokens via env (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
-- Local cache of already-challenged IPs (configurable TTL) to avoid hammering the API.
-- Modes: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
-- **Default is passive mode**: read-only sources + Cloudflare action. For
-  real inline enforcement, `[deployment] mode = "inline"` runs the
-  `sentry-edge` reverse proxy in front of your app (verdicts applied before
-  proxying), and blocked IPs are enforced by a fast-path before the
-  pipeline — see the deployment modes section of the architecture docs.
+- Containment verdicts are mirrored to `ip_state` + `NOTIFY
+  sentry_blocks_changed`, so the fast-path denies the IP **before** the
+  pipeline on every node.
+- Events reach the fan-in as `Incoming::Processed` (verdict already
+  applied); the daemon only persists and dispatches actions.
+- Full details (TLS, challenge, error pages, compression) in
+  [Inline Edge](/en/architecture/edge-inline).

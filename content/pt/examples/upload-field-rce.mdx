@@ -1,0 +1,73 @@
+---
+title: "RCE via campo de upload"
+description: "Command injection escondido no conteúdo de um campo multipart; a inspeção de corpo do Sentry detectou: 80/100 crítico, bloqueado com 403"
+---
+
+# Relato de incidente — injeção de comando via campo de formulário de upload (captura honeypot)
+
+> **Fonte original:**
+> [`incident-report-upload-field-rce.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-upload-field-rce.md)
+> no repositório.
+
+Par de [Mozi: tentativa de RCE](./mozi-rce). Captura real de um deployment
+honeypot de produção do Sentry; os IPs dos atacantes estão parcialmente
+mascarados.
+
+## TL;DR
+
+Um scanner enviou um POST multipart com um payload de injeção de comando
+escondido **dentro do conteúdo de um campo de formulário** — invisível para
+qualquer filtro que só inspeciona URLs, headers ou query strings. A
+inspeção de corpo de requisição do Sentry parseou o payload multipart,
+escaneou o valor do campo e emitiu o sinal `rce` a partir do corpo:
+**80/100 crítico, bloqueado com 403**. A superfície de ataque aqui é
+exatamente aquela que a maioria dos deployments de WAF deixa passar.
+
+## Resumo do evento
+
+| Campo | Valor |
+| --- | --- |
+| Timestamp | 2026-10-07 09:09:16 UTC |
+| Fonte | `http_proxy` (edge inline, porta 80) |
+| Atacante | `13.205.xxx.xxx` (mascarado, faixa de cloud provider) |
+| Método / Path | `POST /` |
+| Corpo da requisição | Formulário multipart, campo `0` carregando conteúdo de injeção de comando |
+| Score de risco | 80 — **crítico** |
+| Verdict | **block** (HTTP 403) |
+| Corpo persistido | Não — apenas metadados e resultados de detecção (por design) |
+
+## A cadeia de sinais
+
+```
+rce                — "upload field 0: cmd" — weight 70
+method_not_allowed — "POST /"              — weight 10
+──────────────────────────────────────────────────
+score 80 → critical → verdict block → 403
+```
+
+O sinal `rce` **não** veio da URL (`/` está vazia de payloads) nem de
+nenhum header. Veio do pipeline de corpo:
+
+1. A edge bufferizou o corpo da requisição dentro do cap de inspeção.
+2. O parser multipart dividiu o formulário em campos.
+3. A heurística `upload_content` escaneou o conteúdo textual de cada campo
+   e casou com a **família de texto `cmd` (command injection)** no campo
+   `0`.
+
+O texto exato do payload não é persistido — o Sentry registra metadados de
+detecção, nunca corpos brutos — mas a família do match é a mesma classe de
+injeção de comando das capturas de Mozi: comandos de shell encadeados
+tentando execução no servidor.
+
+## Por que isto demonstra eficácia
+
+- **Inspeção em nível de corpo é pré-requisito para defesa real contra
+  RCE.** Filtre apenas a query string e esta requisição pontua 10 e passa
+  como um `POST /` sem graça.
+- **A detecção sobrevive ao transporte.** Quer a injeção chegue na query
+  string ([Mozi: tentativa de RCE](./mozi-rce)) ou embrulhada em encoding
+  multipart, a mesma família de heurísticas dispara depois do decode — sem
+  bypass por re-encapsulação.
+- **Privacidade mantida sob condições de ataque.** Mesmo bloqueando uma
+  requisição crítica, o pipeline persistiu zero bytes brutos de corpo —
+  apenas metadados de detecção.

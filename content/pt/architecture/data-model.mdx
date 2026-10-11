@@ -1,130 +1,103 @@
 ---
 title: "Modelo de Dados"
-description: "Event, ProtocolData e helpers de protocolo"
+description: "Event, ProtocolData, HttpData e uploads — o contrato central do Sentry"
 ---
 
 # Modelo de Dados
 
-O `Event` é **modular por design**: campos comuns a qualquer origem vivem no
-top-level; o que é específico de protocolo fica em `ProtocolData` (enum
-extensível). Hoje `Http` cobre nginx; amanhã `Tcp`, `Udp`, `Tls` etc. entram
-sem mudar o core — basta a source popular a variante correspondente. As
-heurísticas e o scorer operam sobre o `Event` e fazem *pattern matching* em
-`protocol`, ignorando campos ausentes.
+O [`Event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L198)
+é **modular por design**: campos comuns a qualquer origem vivem no top-level;
+o que é específico de protocolo fica no enum
+[`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396).
+Heurísticas, regras e o scorer fazem *pattern match* nos helpers de acesso e
+retornam cedo para variantes que não tratam — nenhum estágio do pipeline pode
+assumir que um evento é HTTP.
+
+## Event (top-level)
+
+| Campo | Tipo | Descrição |
+| --- | --- | --- |
+| `id` | `Uuid` | Identificador único do evento |
+| `timestamp` | `DateTime<Utc>` | Momento da observação (ingest, não horário do log) |
+| `source` | [`SourceKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L19) | `Nginx`, `HttpProxy`, `Tcp`, `CloudflareLogs`, `Syslog`, `EdgeTls`, `Synthetic` |
+| `transport` | [`Transport`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L61) | `Tcp`, `Udp`, `Quic`, `Internal` |
+| `direction` | [`Direction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L75) | `Inbound` ou `Outbound` |
+| `client_ip` | `IpAddr` | IP do cliente, sempre canônico (IPv4-mapped vira IPv4 puro) |
+| `client_port` / `server_port` | `Option<u16>` | Portas de origem e de destino observadas |
+| `geo` | `Option<GeoInfo>` | País/subdivisão/cidade/lat/lon (MaxMindDB, populado pelo ingestor) |
+| `asn` | `Option<u32>` | Número do sistema autônomo do IP |
+| `reputation` | `Option<ReputationInfo>` | Tier + feed que casou (F3.7, populado pelo ingestor) |
+| `bot` | `Option<BotStatus>` | Resultado da verificação rDNS de crawler (F7.7, populado pelo pipeline) |
+| `bytes_in` / `bytes_out` | `Option<u64>` | Bytes recebidos/enviados |
+| `duration_ms` | `Option<u64>` | Duração request/response quando conhecida |
+| `raw` | `Option<String>` | Registro original (linha de log, syslog) para auditoria |
+| `protocol` | [`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396) | Payload específico do protocolo |
+
+A source produz um
+[`RawEvent`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L338)
+"magro"; o ingestor promove para `Event` e preenche geo/ASN/reputação.
+
+## ProtocolData (enum de protocolos)
+
+| Variante | Payload | Descrição |
+| --- | --- | --- |
+| `Http(HttpData)` | [`HttpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L413) | Requisição HTTP/1.x ou HTTP/2 (nginx, syslog de proxy, edge inline) |
+| `Tcp(TcpData)` | [`TcpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L484) | Observação de stream TCP não-HTTP: flags, payload reassemblado, `stream_id`, estágio, fingerprint SYN (`window:options:MSS:wscale`) e `syn_count` (agregação de rajada, F5) |
+| `Udp(UdpData)` | [`UdpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L541) | Datagrama UDP; `dns_query` quando parece DNS |
+| `TlsHandshake(TlsData)` | [`TlsData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L550) | ClientHello: `sni`, `ja3`, `ja4`, `cipher`, `version`, `alpn` (F8) |
+| `Syslog(SyslogData)` | [`SyslogData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L577) | Mensagem RFC 5424 (fallback RFC 3164): facility, severity, hostname, app-name, message |
+| `Raw(RawData)` | [`RawData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L568) | Fallback para protocolos sem variante dedicada |
+
+## HttpData (campos principais)
+
+| Campo | Descrição |
+| --- | --- |
+| `method` | `Option<HttpMethod>` — enum tipado (`Get`, `Post`, …, `Other`) |
+| `scheme` / `host` | `http`/`https` e valor do header `Host` |
+| `path` / `query` / `fragment` | Caminho sem query, query string crua, fragmento |
+| `status` | Código de resposta quando observado (edge inline e proxy preenchem) |
+| `user_agent` / `referer` | Headers de identificação |
+| `headers` | Todos os headers capturados pela source (tokens `http_*` do log_format viram chaves `kebab-case`, habilitando regras DSL `header.X`) |
+| `body` | Bytes do corpo quando a source é inline (`body_capture_kb` limita) |
+| `cookies` | Cookies parseados (populados pela edge) |
+| `uploads` | `Option<Vec<UploadInfo>>` — metadados de arquivos enviados (F10); conteúdo nunca persiste |
+| `upstream_time_ms` | `$upstream_response_time` (F12, primeiro valor de listas) |
+
+## UploadInfo / UploadKind (F10)
+
+[`UploadInfo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L450)
+carrega `field_name`, `filename`, `content_type`, `size` e `kind`. O
+[`UploadKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L466)
+classifica por **magic bytes** (declaração do cliente é só dica):
+`Text`, `Image` (PNG/JPEG/GIF/WebP/BMP), `Archive` (ZIP/gzip/bzip2),
+`Executable` (MZ/ELF/Mach-O/shebang), `Pdf`, `Unknown`.
+
+## Helpers de acesso
 
 ```rust
-// sentry-core/src/event.rs
-pub struct Event {
-    // --- comuns a qualquer protocolo ---
-    pub id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    pub source: SourceKind,          // Nginx, Tcp, HttpProxy, CloudflareLogs...
-    pub transport: Transport,        // Tcp | Udp | Tls | Internal
-    pub client_ip: IpAddr,
-    pub client_port: Option<u16>,
-    pub server_port: Option<u16>,    // porta exposta observada
-    pub geo: Option<GeoInfo>,
-    pub asn: Option<u32>,
-    pub direction: Direction,        // Inbound | Outbound
-    pub bytes_in: Option<u64>,
-    pub bytes_out: Option<u64>,
-    pub duration_ms: Option<u64>,
-    pub raw: Option<String>,         // registro original p/ auditoria
-
-    // --- específico do protocolo ---
-    pub protocol: ProtocolData,
-}
-
-pub enum ProtocolData {
-    Http(HttpData),
-    Tcp(TcpData),
-    Udp(UdpData),
-    TlsHandshake(TlsData),
-    Raw(RawData),                    // fallback: bytes + nota
-    // futuras variantes entram aqui sem quebrar consumidores
-}
-
-pub struct HttpData {
-    pub method: HttpMethod,
-    pub scheme: Option<String>,      // http | https
-    pub host: Option<String>,
-    pub path: String,
-    pub query: Option<String>,
-    pub fragment: Option<String>,
-    pub status: Option<u16>,
-    pub user_agent: Option<String>,
-    pub referer: Option<String>,
-    pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,       // quando disponível (proxy/middleware)
-    pub cookies: Option<HashMap<String, String>>,
-}
-
-pub struct TcpData {
-    pub flags: TcpFlags,             // syn/fin/rst/ack...
-    pub payload: Option<Vec<u8>>,    // bytes do stream reconstruído (quando capturável)
-    pub stream_id: Option<u64>,      // p/ correlacionar segmentos
-    pub stage: TcpStage,             // Syn | SynAck | Data | Fin | Reset
-}
-
-pub struct UdpData {
-    pub payload: Option<Vec<u8>>,
-    pub dns_query: Option<String>,   // se for DNS reconhecido
-}
-
-pub struct TlsData {
-    pub sni: Option<String>,
-    pub ja3: Option<String>,         // fingerprint TLS
-    pub ja4: Option<String>,
-    pub cipher: Option<String>,
-    pub version: Option<String>,
-}
-
-pub struct RawData {
-    pub note: String,
-    pub bytes: Vec<u8>,
-}
-
-// Helpers de ergonomia: e.kind_http() -> Option<&HttpData> etc.
 impl Event {
-    pub fn http(&self)  -> Option<&HttpData>  { match &self.protocol { ProtocolData::Http(d) => Some(d), _ => None } }
-    pub fn tcp(&self)   -> Option<&TcpData>   { match &self.protocol { ProtocolData::Tcp(d) => Some(d), _ => None } }
-    pub fn tls(&self)   -> Option<&TlsData>   { match &self.protocol { ProtocolData::TlsHandshake(d) => Some(d), _ => None } }
-    pub fn is_http(&self) -> bool { matches!(self.protocol, ProtocolData::Http(_)) }
+    pub fn http(&self) -> Option<&HttpData>
+    pub fn tcp(&self) -> Option<&TcpData>
+    pub fn tls(&self) -> Option<&TlsData>
+    pub fn syslog(&self) -> Option<&SyslogData>
+    pub fn protocol_kind(&self) -> ProtocolKind
 }
 ```
 
-> **Regra**: nenhum estágio do pipeline pode assumir `ProtocolData::Http`.
-> Heurísticas HTTP verificam `evt.http()` e retornam `None` para outras
-> variantes; heurísticas TCP fazem o análogo. Assim o mesmo pipeline roda
-> para nginx hoje e para captura TCP amanhã.
+Regras DSL usam `protocol_kind()` para condições de protocolo
+([`ProtocolKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L85):
+`Http`, `Http3`, `Tcp`, `Udp`, `Tls`, `Other`).
 
-## AnalysisResult
+## Regra de ouro: adicionando um novo protocolo
 
-```rust
-pub struct AnalysisResult {
-    pub risk_score: u8,               // 0..=100
-    pub risk_level: RiskLevel,        // Info|Low|Medium|High|Critical
-    pub signals: Vec<Signal>,         // o que disparou
-    pub verdict: Verdict,             // Allow|Challenge|Block|Quarantine
-}
-
-pub enum Signal {
-    PathTraversal, SqlInjection, Xss, CmdInjection,
-    UnknownRoute, ScanBehavior, AbnormalRate,
-    SuspiciousUA, TorExitNode, KnownBadIp,
-    AnomalousPayload(/* modelo */),
-    Custom(String),
-}
-```
-
-## Adicionando um novo protocolo
-
-Ao adicionar um novo protocolo:
-
-1. Adicione uma variante a `ProtocolData`.
-2. Adicione um helper em `impl Event` (ex: `pub fn meu_proto(&self) -> Option<&MeuData>`).
+1. Adicione uma variante a
+   [`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396).
+2. Adicione um helper em `impl Event` (ex.: `pub fn meu_proto(&self) -> Option<&MeuData>`).
 3. Atualize `protocol_kind()`.
 4. **Não** adicione campos soltos no `Event` top-level — coloque no enum.
+
+Assim consumidores antigos continuam compilando (só ignoram a variante nova)
+e o mesmo pipeline serve nginx hoje e TCP/TLS amanhã.
 
 ## Normalização de encoding (heurísticas)
 

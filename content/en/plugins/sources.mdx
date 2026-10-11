@@ -1,45 +1,203 @@
 ---
-title: "Source Trait"
-description: "Data source plugins"
+title: "Data sources"
+description: "Source plugins — the Source trait and the sentry-source-* crates"
 ---
 
-# Source Trait
+# Data sources
 
-Every data source is a plugin behind the `Source` trait. The core never knows
-whether an event came from nginx, TCP or Cloudflare logs — it only consumes a
-stream of `RawEvent` normalized into `Event`.
+Every data origin is a plugin behind the
+[`Source`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/source.rs#L26)
+trait. The core never knows whether an event came from nginx, a syslog
+socket, the Cloudflare API or packet capture — it only consumes a stream of
+[`RawEvent`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L338)s
+over a tokio channel, enriches with geo/reputation and promotes them to
+`Event`.
 
 ```rust
-// sentry-core/src/source.rs
+/// A plugin that observes accesses and emits raw events.
 #[async_trait]
 pub trait Source: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn stream(&self) -> anyhow::Result<mpsc::Receiver<RawEvent>>;
+    async fn stream(&self) -> Result<mpsc::Receiver<RawEvent>>;
+    async fn shutdown(&self) -> Result<()> { Ok(()) }
 }
 ```
 
+`stream()` returns the **receiver** end of a bounded channel; the source
+retains the sender and pushes events asynchronously. Dropping the sender
+signals end-of-stream. `shutdown()` is an optional hook called on
+SIGINT/SIGTERM.
+
+## Registration in the daemon
+
+Sources are compiled into the binary (there is no dynamic plugin loading).
+Each `[[source]]` entry in `sentry.toml` — the
+[`SourceConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2063)
+struct with `type` + `options` — becomes a match arm in
+[`daemon::build_registry`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L3189),
+which instantiates the matching crate and registers it through
+[`RegistryBuilder::register_source`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/registry.rs#L80).
+The `tcp` source additionally requires the `pcap` build feature.
+
 ## Implementations
 
-| Crate                          | Source                       | Status  |
-|--------------------------------|------------------------------|---------|
-| `sentry-source-nginx`          | Tail of access.log           | Ready   |
-| `sentry-source-http`           | axum/actix middleware (copy of req) | Future  |
-| `sentry-source-tcp`            | Capture via `pnet`/`pcap` (libpcap)  | Future  |
-| `sentry-source-cloudflare`     | Polling pull of logs via API        | Future  |
-| `sentry-source-syslog`         | RFC 5424 receiver (UDP/TCP)         | Future  |
+| Crate | Origin | Protocol data |
+| --- | --- | --- |
+| [`sentry-source-nginx`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-nginx/src/source.rs) | Tail of `access.log` with rotation support | `HttpData` |
+| [`sentry-source-syslog`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-syslog/src/source.rs) | Syslog receiver UDP/TCP (RFC 5424 + 3164 fallback) | `SyslogData` |
+| [`sentry-source-cloudflare`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-cloudflare/src/source.rs) | Polling of the Cloudflare Logs API (NDJSON) | `HttpData` |
+| [`sentry-source-tcp`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-tcp/src/source.rs) | Passive packet capture (`pcap` feature) | `TcpData` |
 
-## Dynamic registration
+## nginx — access.log tail
 
-Each plugin exposes `pub fn register(reg: &mut Registry)`. The binary enables
-plugins via Cargo feature flags + an entry in `sentry.toml`. **No recompilation
-needed to enable/disable** — only config.
+The
+[`NginxSource`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-nginx/src/source.rs#L47)
+tails the log file (100 ms poll), compiling the nginx `log_format`
+(`$var` syntax) into the
+[`LogFormat`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-nginx/src/parser.rs#L25)
+parser. In the daemon the tail always starts from the end of the file
+(`start_from_end`). Rotation is detected by truncation/file shrinkage (or
+disappearance) and the file is reopened; unparseable lines are logged as
+`warn` and skipped.
+
+- **Real client IP**: the parser resolves it automatically by fixed
+  precedence — `$http_cf_connecting_ip` > `$http_true_client_ip` >
+  `$http_x_real_ip` > first XFF entry (`$http_x_forwarded_for`) >
+  `$remote_addr`. With `[real_ip]` configured (`trusted_proxies` + bundled
+  Cloudflare ranges), header-borne IPs only win when they come from trusted
+  proxies (anti-spoof guard); without `[real_ip]` the precedence is
+  unconditional. The daemon always compiles the parser with the
+  [`TrustSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/trust.rs)
+  via
+  [`compile_with_trust`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-nginx/src/parser.rs#L49).
+- **Headers**: every `http_*` token in the `log_format` becomes a header in
+  `HttpData.headers` (`$http_cf_connecting_ip` → `cf-connecting-ip`),
+  usable in DSL rules via `header.cf-connecting-ip = ...`.
+
+```toml
+[[source]]
+type = "nginx"
+[source.options]
+path = "/var/log/nginx/access.log"
+format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+# Behind Cloudflare, add the client-IP header to the nginx log_format
+# AND to the `format` line above, e.g.: ... "$http_cf_connecting_ip"'
+```
+
+## syslog — UDP/TCP receiver
+
+The
+[`SyslogSource`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-syslog/src/source.rs#L68)
+binds its socket inside `stream()` (bind failures surface as errors instead
+of dying silently) and each message becomes a `ProtocolData::Syslog` event.
+The peer address is the client IP.
+
+- **Parser**: RFC 5424 with automatic RFC 3164 fallback
+  ([`parse_syslog`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-syslog/src/parser.rs#L31)).
+- **TCP framing**: RFC 6587 — octet-counting (detected by a leading ASCII
+  digit) or newline-terminated.
+- **Transport**: UDP datagrams or TCP connections (one task per
+  connection).
+
+```toml
+[[source]]
+type = "syslog"
+[source.options]
+bind = "0.0.0.0:5140"   # ports below 1024 need root; 5140 avoids that
+transport = "udp"       # udp | tcp
+```
+
+The default bind is
+[`0.0.0.0:5140`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-syslog/src/source.rs#L24)
+and the default transport is `udp`.
+
+## cloudflare — Logs API polling
+
+The
+[`CloudflareSource`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-cloudflare/src/source.rs#L43)
+queries `GET /zones/{zone}/logs/received?start=&end=` (Logpull Received,
+NDJSON response) on a fixed interval and feeds the same pipeline as the
+nginx tail.
+
+- **Cursor**: the first window starts at `start` (RFC 3339, default: now)
+  and the cursor advances to the newest timestamp seen — polling neither
+  repeats nor skips windows.
+- **RayID dedupe**: replayed windows do not double-count requests (bounded
+  set of 100,000 RayIDs).
+- **Interval**: 30 s by default, with a 5 s floor.
+- **Plan**: the received-logs Logs API requires an **Enterprise**
+  entitlement — error responses log a warning saying exactly that.
+- **Token**: read from the env var named by `token_env` (default
+  `SENTRY_CF_TOKEN`), with `Logs:Read` permission. `zone_id` is required.
+
+```toml
+[[source]]
+type = "cloudflare"
+[source.options]
+zone_id = "023e105f4ecef8ad9ca31a8372d0c353"
+# token_env = "SENTRY_CF_TOKEN"
+# start = "2026-09-30T00:00:00Z"   # first-window cursor (default: now)
+# api_base = "https://api.cloudflare.com/client/v4"
+```
+
+## tcp — passive capture + SYN fingerprinting
+
+The
+[`TcpCaptureSource`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-tcp/src/source.rs#L75)
+captures packets with the `pcap` feature (build with
+`--features sentry-cli/pcap`; needs Npcap on Windows or `CAP_NET_RAW` on
+Linux). Without the feature, the pure logic (fingerprinting + flow table)
+is still exported for inline consumers.
+
+- **Filter**: `interface` is required; `ports` (CSV) filters destination
+  ports (empty = all).
+- **Flows**: table with FIFO eviction (`flow_cap`, default 65,536 flows)
+  and up to 8 KiB of reassembled payload per flow (`payload_cap`).
+- **SYN fingerprinting**: every SYN yields the
+  `window:options:MSS:wscale` signature
+  ([`SynFingerprint`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/tcpfp.rs#L14),
+  MuonFP/p0f style). The scanner table covers masscan/zmap/nmap
+  ([`scanner_name`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/tcpfp.rs#L90))
+  and feeds the `TcpScanner` signal to the scorer — port scans HTTP access
+  logs never see.
+- **SYN aggregation**: inside the `syn_window_ms` window (default 100 ms,
+  `0` disables), all SYNs from one source IP collapse into **one** event
+  carrying `TcpData.syn_count` — a burst becomes one event per IP, not one
+  per packet
+  ([`SynAggregator`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-tcp/src/aggregate.rs#L35)).
+- **Backpressure**: `channel_buffer` (default 1024, minimum 64) is the
+  queue between the capture loop and the daemon — raise it under high-PPS
+  capture.
+
+```toml
+[[source]]
+type = "tcp"
+[source.options]
+interface = "eth0"      # required
+ports = "80,443,8443"   # destination-port filter; empty = all
+channel_buffer = 1024   # capture -> daemon queue
+syn_window_ms = 100     # per-IP SYN coalescing window (0 = off)
+```
+
+## `Raw`/`Processed` fan-in (inline edge)
+
+Passive sources produce `RawEvent`s and the daemon's ingest loop runs the
+pipeline once over them. In `[deployment] mode = "inline"` the edge shares
+the same `Arc<Pipeline>` and publishes **already-decided** events: the
+ingestor consumes both paths via the
+[`Incoming::{Raw, Processed}`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L1914)
+enum — edge events do not re-run the pipeline (trackers are not
+double-counted).
 
 ## Conventions
 
-- Every plugin crate (`sentry-source-*`) depends only on `sentry-core`, never
-  on other plugins.
-- `sentry-core` is **pure** (no heavy I/O, no HTTP, no DB). It defines
-  contracts.
-- Shared deps live in `[workspace.dependencies]` at the root; each crate
-  references them via `{ workspace = true }`.
-- Heavy features (ONNX) are **optional** and disabled by default.
+- Every `sentry-source-*` crate depends only on `sentry-core`, never on
+  other plugins.
+- `sentry-core` is **pure** (no heavy I/O, no HTTP, no DB) — it defines the
+  contracts (`Source`, `RawEvent`, `ProtocolData`).
+- Event channels are bounded, created by
+  [`event_channel`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/source.rs#L49);
+  sends go through
+  [`send_or_log`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/source.rs#L64),
+  which aggregates drop logs per 5 s window (`sentry_events_dropped_total`
+  per source) instead of logging one line per event.

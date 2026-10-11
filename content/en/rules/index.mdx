@@ -1,123 +1,218 @@
 ---
 title: "Rules Engine"
-description: "Deterministic WAF-style rules engine"
+description: "Deterministic WAF-style rules engine — the fast path before heuristics and AI"
 ---
 
 # Rules Engine
 
 Sentry has a **deterministic rules engine** that runs **before** heuristics
-and AI — it's the "fast path". Inspired by Cloudflare's Custom Rules / WAF:
-each rule is a *match* + *action*, evaluated in priority order, with
-**short-circuit**. Rules are the first line of defense (instant blocking of
-VPNs, crawlers, ASNs, countries) and also the source of **allowlists** (trusted
+and AI — the "fast path" of
+[`Pipeline::process`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L465).
+Inspired by Cloudflare's Custom Rules / WAF: each rule is a *match* +
+*action*, evaluated in ascending priority order, with **short-circuit**.
+Rules are the first line of defense (instant blocking of scanners, Tor,
+VPN/proxy, countries) and also the source of **allowlists** (trusted
 IPs/ASNs that bypass all scoring).
 
-## Model
+## Evaluation semantics
+
+The
+[`RuleSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L188)
+keeps rules sorted by `priority` (lower = evaluated first) and
+[`evaluate_with`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L326)
+returns the **first match**. What happens next depends on the
+[`RuleAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L126):
+
+| Action                              | Effect                                                          |
+|-------------------------------------|------------------------------------------------------------------|
+| `Allow`                             | **Short-circuit**: bypasses scoring and AI entirely (allowlist). |
+| `Block` / `Challenge` / `RateLimit` | **Short-circuit**: executes containment and ends the pipeline.   |
+| `Log`                               | Annotates the event (`RuleHit`, weight 0) and **continues** into heuristics + AI. |
+| `Tag`                               | Same as `Log`: annotates and lets it flow.                       |
+
+Order at a glance:
+
+```text
+Normalized event
+  └─ Rules Engine (by priority; first match wins)
+       ├─ Allow                      → Allow + bypass scoring/AI
+       ├─ Block/Challenge/RateLimit  → immediate containment (short-circuit)
+       ├─ Log/Tag                    → annotate and continue
+       └─ no match                   → heuristics → reputation → routes
+                                       → scorer → policy → decider
+```
+
+A `Block`/`Challenge`/`RateLimit` short-circuit emits a
+[`RuleHit`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L535)
+signal with a fixed weight per verdict (Block 100, Challenge 50, RateLimit
+30) and still respects the never-ban guard (`[real_ip] trusted_ips`) and the
+[`cap_shadow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L782)
+flag — shadow-listed IPs are analyzed but never banned. Console verbosity
+for short-circuited events is controlled by the rule's `log_level`
+(`silent` suppresses the line; the event is still stored and dispatched).
+
+## Core types
+
+Defined in
+[`crates/sentry-core/src/rules.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs).
+
+**[`Rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L155)** — a single rule:
 
 ```rust
-// sentry-core/src/rules.rs
 pub struct Rule {
     pub id: RuleId,
     pub name: String,
-    pub priority: i32,              // lower = evaluates first
+    pub priority: i32,
     pub enabled: bool,
-    pub match_: RuleMatch,          // condition (combinable with AND/OR)
+    pub match_: RuleMatch,
     pub action: RuleAction,
-    pub ttl: Option<Duration>,      // dynamic rules expire (ex: temp block)
-    pub source: RuleSource,         // Config | Db | CloudflareSync | AutoLearned
-    pub tags: Vec<String>,          // ex: "default", "vpn", "crawler"
+    pub ttl: Option<Duration>,
+    pub source: RuleSource,
+    pub tags: Vec<String>,
+    pub log_level: Option<RuleLogLevel>,
 }
-
-pub enum RuleAction {
-    Allow,                          // bypasses scoring + AI (absolute allowlist)
-    Block,
-    Challenge,                      // Cloudflare managed/js challenge
-    RateLimit { req_per_sec: u32, window: Duration },
-    Log,                            // logs only, no action (shadow mode)
-    Tag(String),                    // annotates the event, continues pipeline
-}
-
-// Combinable expressions — same idea as CF matchers
-pub enum RuleMatch {
-    Ip(IpMatcher),                 // exact IP | CIDR | range
-    Asn(u32),
-    Country(IsoCode),
-    Path(PathMatcher),             // exact | glob | regex
-    Method(HttpMethod),
-    Header { name: String, op: StrOp },
-    UserAgent(StrOp),
-    Query(StrOp),
-    Body(StrOp),                   // when available
-    Protocol(ProtocolKind),        // Http | Tcp | Tls...
-    TlsFingerprint { ja3: Option<String>, ja4: Option<String> },
-    Reputation(ReputationTier),    // Clean | Suspicious | Malicious | Datacenter | Vpn | Tor
-    Status(u16),                   // ex: status == 404
-    Rate { count: u32, per: Duration, scope: RateScope },
-    Time { window: TimeWindow },   // only active during business hours etc.
-    All(Vec<RuleMatch>),           // AND
-    Any(Vec<RuleMatch>),           // OR
-    Not(Box<RuleMatch>),
-}
-
-pub enum IpMatcher { Single(IpAddr), Cidr(IpCidr), Range { from: IpAddr, to: IpAddr } }
-pub enum StrOp { Equals(String), Contains(String), Regex(Regex), StartsWith(String), In(Vec<String>) }
 ```
 
-## Pipeline precedence
+- `ttl` expires dynamic rules (temporary blocks; the Cloudflare reaper uses
+  the same `sentry:<ts>:<ttl>` stamp format).
+- `log_level` controls the console line verbosity (`silent`, `info`,
+  `warn`, `error`).
+- Config rule ids are a stable ASCII slug of the name
+  (`allow_internal_monitoring`).
 
-<Mermaid chart={`
-flowchart LR
-    EVT[Evento normalizado] --> R{Rules Engine<br/>avalia em prioridade}
-    R -->|Allow rule hit| BY[Allow + bypass scoring/AI]
-    R -->|Block/Challenge/RateLimit hit| ACT[Executa Action<br/>+ short-circuit]
-    R -->|Log/Tag hit| AN[Anota + continua]
-    R -->|nenhuma regra| HEUR[Heurísticas → IA → Scorer]
-    BY --> PERSIST[Persistir]
-    ACT --> PERSIST
-    AN --> HEUR
-    HEUR --> PERSIST
-`} />
+**[`RuleAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L126)** — `Allow | Block | Challenge | RateLimit | Log | Tag`.
 
-Order: **Allowlist** (absolute trust) > **explicit blocklist** >
-**reputation/VPN/Tor defaults** > **crawler/UA defaults** > **sensitive
-paths** > (falls through to heuristics+AI). The allowlist is the *escape hatch*
-to avoid false positives on your own IPs (healthchecks, monitoring, CI).
+**[`RuleSource`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L108)** — where the rule came from:
+
+| Variant          | Origin                                                              |
+|------------------|----------------------------------------------------------------------|
+| `Config`         | `[[rules.custom]]` in `sentry.toml`.                                  |
+| `Db`             | Created via CLI/dashboard, persisted in Postgres.                     |
+| `CloudflareSync` | Mirror of live Cloudflare edge rules (startup reconcile).             |
+| `Feed`           | Generated by the reputation feed/dataset importer (`feed:<name>`).    |
+| `AutoLearned`    | TTL auto-block derived from confirmed incidents.                      |
+| `DefaultPack`    | Built-in default pack.                                                |
+
+**[`RuleMatch`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L358)** — the condition (composable `All`/`Any`/`Not` tree).
+The full reference for conditions and the textual syntax lives on the
+[Match DSL](/en/rules/dsl) page.
+
+**[`RuleSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L188)** — a compiled set sorted by priority, with
+[`replace_by_prefix`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L307)
+for atomic replacement of rule groups (used by dataset hot-reload).
+
+**`SharedRuleSet`** — alias `Arc<RwLock<RuleSet>>`
+([definition](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L198)):
+the daemon shares one handle across pipeline, inline edge and CLI; the
+hot-reload task swaps the inner set with `write()` and evaluation reads it
+with `read()`.
 
 ## Rule sources
 
-1. **Config (`sentry.toml`)** — static rules, versioned with the app.
-2. **Postgres (`rules` table)** — dynamic rules created via CLI/dashboard,
-   hot-reloaded without restarting.
-3. **Cloudflare sync** — imports CF Custom Rules/WAF as local rules (mirror)
-   for local decision in a future inline mode.
-4. **Auto-learned** — IPs confirmed malicious by the decider become a
-   dynamic `Block` rule with TTL (feedback loop).
-5. **Reputation feeds** — public blocklists (Spamhaus DROP, Emerging
-   Threats, FireHOL) synced periodically → become `Block` rules tagged
-   `feed:spamhaus`.
+1. **Config (`sentry.toml`)** — [`[[rules.custom]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1948)
+   compiled by
+   [`rules_from_config`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L210):
+   an invalid DSL expression fails **only that rule** (the error names it),
+   not the whole config.
+2. **Postgres (`rules` table)** — dynamic rules created via CLI
+   (`sentry rules add/allow/block`) or the dashboard.
+3. **Default packs** — see [Default Rule Packs](/en/rules/packs).
+4. **Reputation feeds and datasets** — synthetic `feed:<name>` rules
+   (priority 50) built by
+   [`feed_rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L210)
+   (IP, when the feed declares an `action`) and
+   [`dataset_rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L274)
+   (`user_agent`/`path`/`ja3`).
+5. **Cloudflare sync** — startup reconcile adopts live edge rules as a
+   local mirror (`CloudflareSync`).
+6. **Auto-learned** — repeat-offender escalation persisted in `ip_state`.
 
-Hot-reload: the daemon watches the `rules` table (Postgres `LISTEN/NOTIFY`)
-and updates an in-memory `Arc<RwLock<RuleSet>>` without restart. Evaluation
-is indexed by IP-hash/ASN/country to avoid iterating all rules per event.
+## Hot-reload
 
-## Rules management CLI
+- **`sentry_rules_changed`** — the
+  [`rules_hot_reload`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2775)
+  task `LISTEN`s on the Postgres channel, reloads the ruleset from the
+  database and swaps the `Arc<RwLock<RuleSet>>` without a restart. The CLI
+  and dashboard emit the `NOTIFY`.
+- **`sentry_datasets_changed`** — the
+  [`datasets_hot_reload`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2877)
+  task rebuilds the `dataset:`-prefixed rules via `replace_by_prefix`
+  (atomic, all-or-nothing) and refreshes the prefilter literals.
+- Postgres is the source of truth: a node that starts later loads the
+  ruleset from the database at startup.
+
+## Performance caches (F5)
+
+- **Process-lifetime regex cache**
+  ([`REGEX_CACHE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L34))
+  and **IP-spec cache**
+  ([`IP_CACHE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L74)):
+  patterns compile once (the old code compiled a regex per rule per event —
+  ~3.4 ms/event). Invalid patterns are cached as `None` so broken rules
+  don't re-parse on every event.
+- **Aho-Corasick prefilter** — heuristics only run a family's regex when
+  one of its literals appears in the text
+  ([`PREFILTER`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L289),
+  an `ArcSwap`); `user_agent`/`path` datasets join that gate via
+  [`reload_dataset_lists`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L296),
+  alongside
+  [`SENSITIVE_PATH_RE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L537)
+  and
+  [`BAD_CRAWLER_RE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L540).
+- **Decode-once** — the URL-decoded path is computed once per evaluation
+  ([`EvalCtx`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L722))
+  and shared by every `path` condition; rules can't be bypassed by encoding
+  (`%2e%2e%2f` = `../`, `+` = space —
+  [`url_decode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L773)).
+
+## Config packing
+
+Default packs are declared like this:
+
+```toml
+[[rules.pack]]
+name = "vpn_proxy"
+mode = "shadow"          # shadow | enforce | off
+
+[[rules.pack]]
+name = "country_blocklist"
+mode = "enforce"
+
+[rules.pack.params]
+countries = ["RU", "CN"]
+```
+
+Each pack becomes a pair of keys in the mode map and each param is
+**flattened** as `<pack>__<param>` (e.g. `country_blocklist__countries`)
+before reaching the builder —
+[wiring in the daemon](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L154).
+This flattening (F7.6) fixed the bug where pack params never reached the
+builder. Only strings and arrays of strings are rendered. The params read
+today are `country_blocklist__countries` and `host_allowlist__domains`
+([`pack_list_param`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L166)).
+
+## Rule management CLI
 
 ```bash
-sentry rules list [--tag vpn] [--enabled] [--source db|config|feed]
+sentry rules list                                  # list active rules
 sentry rules show <id>
 sentry rules add --name "block admin from RU" \
     --match 'country=RU AND path=/admin/*' --action block --priority 10
 sentry rules allow <ip> [--ttl 24h] [--note "monitoring agent"]
 sentry rules block <ip> [--ttl 24h] [--note "scan"]
-sentry rules allow-asn <asn> [--note "our DC"]
-sentry rules block-asn <asn>
-sentry rules enable <id>
-sentry rules disable <id>
-sentry rules delete <id>
-sentry rules import-feed spamhaus      # syncs reputation feed
-sentry rules packs list                # shows packs and state (shadow/enforce/off)
-sentry rules packs enable vpn_proxy --mode enforce
-sentry rules packs disable crawlers_good
-sentry rules test <ip>                 # simulates: which rules would match this IP now
-sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
+sentry rules enable <id> | disable <id> | delete <id>
+sentry rules packs                                 # default pack state
+sentry rules test --path /admin --method GET --ip 1.2.3.4 --ua "sqlmap/1.0"
 ```
+
+`sentry rules test` evaluates the match expression against a hypothetical
+event — use it to validate rules before promoting them to `enforce`.
+Per-IP `allow`/`block` actions write to Postgres and emit `NOTIFY`, so
+running nodes hot-reload without a restart.
+
+## Next steps
+
+- [Match DSL](/en/rules/dsl) — full condition syntax.
+- [Default Rule Packs](/en/rules/packs) — the current pack catalog.
+- [Shadow vs Enforce](/en/rules/shadow-vs-enforce) — safe rollout and
+  verdict policy.

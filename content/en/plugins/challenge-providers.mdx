@@ -1,66 +1,197 @@
 ---
 title: "Challenge Providers"
-description: "Edge actions provider-agnostic via ChallengeProvider"
+description: "Provider-agnostic edge actions — the ChallengeProvider trait and the built-in providers"
 ---
 
-# Edge Actions and ChallengeProvider
+# Edge actions and `ChallengeProvider`
 
 Edge actions (block / challenge / rate-limit at CDN/WAF) are
-**provider-agnostic** via the `ChallengeProvider` trait, mirroring the
-`LlmProvider` pattern. This lets you switch from Cloudflare to AWS WAF,
-Fastly, Bunny… without changing `ActionKind`, the rules, or the verdict
-filter.
+**provider-agnostic** via the
+[`ChallengeProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L95)
+trait, mirroring the `LlmProvider` pattern. This lets you swap Cloudflare
+for AWS WAF, Fastly, Bunny… without changing `ActionKind`, the rules, or
+the verdict filter.
 
-## How it works
+```rust
+/// A provider that can apply an edge action (block / challenge / rate-limit).
+#[async_trait]
+pub trait ChallengeProvider: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn apply(&self, ip: IpAddr, verdict: Verdict, opts: &EdgeOptions) -> Result<()>;
+}
+```
 
-The `ChallengeAction` type (in `sentry-core`) does the **verdict filter**
-(`Block`/`Challenge`/`RateLimit`) and **delegates** to the provider. The
-provider only implements `apply(ip, verdict, opts)`. The "which verdict
-becomes an action" logic lives in core; the provider just executes at the
-edge.
+The provider receives
+[`EdgeOptions`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L71)
+(`ttl` + `mode`, where `mode` is an
+[`EdgeMode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L31):
+`block | js_challenge | managed_challenge | rate_limit`) and may derive the
+effective mode from the `verdict`. Implementations must be idempotent and
+keep their own de-duplication cache — the daemon may replay decisions
+after a restart.
 
-## Canonical config
+## Verdict filter — `ChallengeAction`
+
+The "which verdict becomes an action" logic lives once, in core: the
+[`ChallengeAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L114)
+type wraps the provider and its `applies_to` accepts only `Block`,
+`Challenge` and `RateLimit`. `Allow` (benign) and `Quarantine` (held for
+LLM analysis) are filtered out centrally — the provider never repeats the
+check. The provider just executes at the edge.
+
+## Built-in providers
+
+The providers known to
+[`daemon::build_challenge_action`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L3617):
+
+| Provider | Crate | Enforcement | Notes |
+| --- | --- | --- | --- |
+| `cloudflare` | [`sentry-action-cloudflare`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-cloudflare/src/lib.rs) | IP Access Rules + IP Lists (IPv6) | API; TTL via `notes` |
+| `firewall` | [`sentry-action-firewall`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-firewall/src/lib.rs) | nftables / ipset / firewalld | kernel; Linux-only; runs inline |
+| `opnsense` | [`sentry-action-opnsense`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-opnsense/src/lib.rs) | alias table via REST `alias_util` | drop-only |
+| `pfsense` | [`sentry-action-opnsense`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-opnsense/src/lib.rs) | `pfctl` table | drop-only |
+| `nginx` | [`sentry-action-nginx`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-nginx/src/lib.rs) | deny includes + JS challenge geo map | same host as the daemon |
+
+## Cloudflare
+
+Applies block/challenge/rate-limit via **IP Access Rules**
+(`POST /zones/{zone}/firewall/access_rules/rules`; the legacy
+`/firewall/rules` endpoint was deprecated). The API has no per-rule TTL,
+so every rule Sentry creates carries the stamp
+`sentry:<created_unix>:<ttl_secs>` in `notes` — expiry recoverable across
+restarts.
 
 ```toml
 [[action]]
 type = "challenge"
-provider = "cloudflare"        # extensible: aws_waf, fastly, ...
+provider = "cloudflare"
 [action.options]
-mode = "managed_challenge"     # block | js_challenge | managed_challenge | rate_limit
+mode = "managed_challenge"   # block | js_challenge | managed_challenge | rate_limit
+ttl_secs = 86400
+# max_failures = 3           # circuit breaker (default 3)
+# ipv6_prefix = 64           # block/rate-limit IPv6 via IP List
+# list_name = "sentry_blocks"
+```
+
+- **Env**: `SENTRY_CF_TOKEN` + `SENTRY_CF_ZONE` required (without them the
+  action is skipped with a warning); `SENTRY_CF_ACCOUNT` optional (the
+  account id is derived from the zone lookup when absent).
+- **Reconcile at startup**: verifies the token, re-adopts live edge rules
+  into the local cache (preventing duplicate inserts) and deletes expired
+  ones.
+- **Reaper**: a background task (300 s) deletes rules whose `notes`-encoded
+  TTL has lapsed.
+- **Idempotency**: `duplicate-rule` (CF 10009) is treated as success.
+- **Circuit breaker**: after `max_failures` consecutive failed inserts the
+  provider disables itself until restart (a config failure does not
+  generate an endless stream of doomed requests).
+- **IPv6 /64 (F2.14)**: IP Access Rules accept exact addresses only; with
+  `ipv6_prefix`, `Block`/`RateLimit` verdicts for IPv6 clients become
+  prefix items in an account-level IP List (`sentry_blocks`) + a single
+  custom rule `ip.src in $sentry_blocks` (block action).
+
+## firewall
+
+Kernel bans (same crate described in
+[Actions](/en/plugins/actions#sentry-action-firewall)). The only provider
+that runs **inline** in the hot path by default — local containment, zero
+queueing latency.
+
+```toml
+[[action]]
+type = "challenge"
+provider = "firewall"
+[action.options]
+backend = "auto"     # auto | nftables | ipset | firewalld
 ttl_secs = 86400
 ```
 
-The legacy alias `type = "cloudflare"` (without `provider`) is kept for
-compatibility and is equivalent.
+## opnsense / pfsense
+
+Appliance bans — one crate, two protocols (details in
+[Actions](/en/plugins/actions#sentry-action-opnsense)). Drop-only
+platforms: `Challenge` and `RateLimit` are logged as *unenforced*.
+
+```toml
+[[action]]
+type = "challenge"
+provider = "opnsense"   # or "pfsense"
+[action.options]
+base_url = "https://192.0.2.10"   # required for opnsense
+table = "sentry_blocks"
+```
+
+## nginx
+
+Include generation + reload (details in
+[Actions](/en/plugins/actions#sentry-action-nginx)). For the JS challenge,
+include the generated snippet inside your `server {}`:
+
+```nginx
+include /etc/nginx/conf.d/sentry/sentry-challenge-if.conf;
+```
+
+```toml
+[[action]]
+type = "challenge"
+provider = "nginx"
+[action.options]
+conf_dir = "/etc/nginx/conf.d/sentry"
+reload_cmd = "nginx -s reload"
+validate = true
+```
+
+## Never-ban guard
+
+IPs in `[real_ip] trusted_ips` (and `trusted_lists`/`whitelist`, which
+join the same set) are **never** banned: the pipeline short-circuits to
+`Allow` and tags the IP as `ReputationTier::Authorized` — so the
+`ChallengeAction` verdict filter does not even fire. The local containment
+providers (`firewall`, `opnsense`/`pfsense`, `nginx`) refuse the IP again
+as a final guard, before any command or API call; the inline edge
+fast-path honors the set too.
+
+## Compatibility alias
+
+`type = "cloudflare"` without `provider` is equivalent to the canonical
+`type = "challenge"` + `provider = "cloudflare"` form and kept for
+compatibility. New configs should prefer the canonical form.
 
 ## Adding a new edge provider (AWS WAF, Fastly, Bunny…)
 
 1. Create the crate `sentry-action-<name>` implementing `ChallengeProvider`.
 2. Add it to `sentry-cli/Cargo.toml`.
-3. Add an arm to the `daemon::build_challenge_action` match.
+3. Add an arm to the
+   [`daemon::build_challenge_action`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L3617)
+   match.
 
 Without changing `ActionKind`, rules, or the verdict filter.
 
-## Cloudflare (default provider)
+## Provider-free option: PoW challenge at the inline edge
 
-- Tokens via env (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
-- Local cache of already-challenged IPs (configurable TTL) to avoid hammering the API.
-- Modes: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
-- **Default is passive mode** (read-only + Cloudflare action). For
-  enforcement at your own infra, `[deployment] mode = "inline"` runs the
-  `sentry-edge` reverse proxy and blocked IPs are denied by a fast-path
-  before the pipeline.
+In `[deployment] mode = "inline"` there is an option that talks to no API
+at all: the built-in interactive JavaScript challenge with proof-of-work
+([`JsChallenge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/challenge.rs#L70),
+opt-in under `[edge.challenge]`). A `Challenge` verdict becomes a 503
+interstitial with a SHA-256 puzzle; the solution becomes the
+`sentry_ch=<bucket>:<nonce>` cookie, valid for one bucket of grace.
 
-## Cloudflare integration (synergy)
+```toml
+[edge.challenge]
+enabled = true
+# secret_env = "SENTRY_EDGE_CHALLENGE_SECRET"  # required when enabled
+# bucket_secs = 3600   # challenge and cookies rotate per bucket
+# difficulty = 16      # leading zero bits (clamped 8..=28)
+# template_path = "/etc/sentry/challenge.html"  # custom page (hot-read)
+```
 
-<Mermaid chart={`
-flowchart LR
-    EVT[Evento High/Critical] --> CF1{Cloudflare habilitado?}
-    CF1 -->|sim| CF2[Resolver zona+IP]
-    CF2 --> CF3{Já bloqueado recentemente?}
-    CF3 -->|não| CF4[Criar/Atualizar firewall rule]
-    CF3 -->|sim| CF5[Estender TTL]
-    CF4 --> CF6["Challenge mode: js_challenge / managed_challenge / block"]
-    CF6 --> CF7[Webhook confirmação]
-    CF1 -->|não| BL[Blocklist local only]
-`} />
+- The secret (`SENTRY_EDGE_CHALLENGE_SECRET`, 32+ random bytes) is
+  **required** when `enabled = true` — startup fails without it.
+- Who executes the `Challenge` verdict at the edge is decided by
+  `challenge_backend`
+  ([`ChallengeBackend`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1490)):
+  `sentry` (default, built-in PoW) or `cloudflare` (the verdict becomes a
+  CF rule; requires an action with `provider = "cloudflare"`).
+- The PoW **never** unlocks a `Block`; bots verified via rDNS
+  (`[bot_verification]`) pass without solving; the cookie gets `Secure`
+  when the edge itself terminates TLS.

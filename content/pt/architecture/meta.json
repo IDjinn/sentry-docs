@@ -1,4 +1,4 @@
 {
   "title": "Arquitetura",
-  "pages": ["index", "data-model", "request-flow", "risk-levels", "daemon-lifecycle"]
+  "pages": ["index", "data-model", "request-flow", "risk-levels", "daemon-lifecycle", "edge-inline", "performance"]
 }

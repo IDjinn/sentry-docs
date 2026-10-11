@@ -1,0 +1,44 @@
+---
+title: "Exemplos"
+description: "Relatos de incidentes reais capturados por um deployment honeypot do Sentry"
+---
+
+# Exemplos
+
+Os relatos desta seção são **capturas reais** de um deployment de produção
+do Sentry operando como **honeypot** — um alvo deliberadamente exposto à
+internet. Cada página é um relato pós-incidente: o que atacou, como o
+pipeline detectou, qual verdict foi aplicado e o que a forense confirmou
+depois. Os IPs dos atacantes estão parcialmente mascarados, exatamente como
+publicados.
+
+Nada aqui é tráfego de laboratório: são worms, scanners e sondas reais da
+internet pública, detectados pelas mesmas heurísticas, packs de regras e
+inspeção de corpo que rodam em qualquer deployment do Sentry. Scores,
+timestamps, pesos de sinais e métricas são reproduzidos exatamente como
+capturados.
+
+## Os relatos
+
+| Relato | Cenário | O que demonstra |
+| --- | --- | --- |
+| [Mozi: tentativa de RCE](./mozi-rce) | Worm Mozi tenta injeção de comando em roteador NetGear (`setup.cgi?todo=syscmd`) | Heurística `CmdInjection` + edge inline bloqueando com 403 + ban de 24h na blocklist (`ip_state`) + incidente automático + forense limpa |
+| [Propagação do worm Mozi](./mozi-propagation) | O mesmo worm volta de outro host infectado, com a URL de download apontando para o próprio IP do atacante | Propagação worm host-a-host (C2 embutido no payload), telemetria em camadas TCP + HTTP, detecção idêntica em infecções independentes |
+| [Scanner distribuído MCP/SSE](./mcp-scanner) | 25 IPs sondam infraestrutura de IA (MCP/SSE), uma sonda por IP para escapar de rate limit por IP | Pack de regras `bad_crawler` (dataset curado de User-Agents) no fast path de reputação: 25/25 com score 100, bloqueados e banidos |
+| [RCE via campo de upload](./upload-field-rce) | Command injection escondido no conteúdo de um campo de formulário multipart | Inspeção de corpo de requisição (F10): parser multipart + heurística `upload_content`, com zero bytes de corpo persistidos |
+
+## Arquivos originais
+
+Os relatos completos, no formato original, vivem no diretório
+[`examples/`](https://github.com/IDjinn/sentry/tree/main/examples) do
+repositório principal:
+
+- [`incident-report-mozi-rce.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mozi-rce.md)
+- [`incident-report-mozi-propagation.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mozi-propagation.md)
+- [`incident-report-mcp-scanner.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mcp-scanner.md)
+- [`incident-report-upload-field-rce.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-upload-field-rce.md)
+
+## Leitura relacionada
+
+- [Rules Engine](../rules) — packs de regras, fast path de reputação e DSL
+- [Arquitetura](../architecture) — fluxo de requisição e níveis de risco

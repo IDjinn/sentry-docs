@@ -1,85 +1,149 @@
 ---
 title: "Fluxo de uma Requisição"
-description: "Sequência de estágios do log à ação"
+description: "Estágios do pipeline, do ingest à ação — passivo e edge inline"
 ---
 
 # Fluxo de uma Requisição
 
-Quando uma linha de access log chega, o Sentry a normaliza em um `Event`,
-envia ao pipeline, que faz fan-out paralelo para heurísticas, IA e validador
-de rotas. Os resultados convergem no scorer, que produz um `AnalysisResult`.
-O decisor aplica a política e despacha para as actions.
+O Sentry opera em dois modos de ingestão, definidos em
+`[deployment] mode`:
 
-<Mermaid chart={`
+- **Passivo** (default): sources read-only fazem tail de logs / recebem
+  syslog / capturam pacotes. O pipeline analisa o evento e as actions
+  reagem (block no Cloudflare/firewall, webhook, …) — a requisição já
+  aconteceu.
+- **Inline** (`sentry-edge`): o Sentry é o reverse proxy na frente da
+  aplicação. O request passa pelo **mesmo** `Arc<Pipeline>` **antes** do
+  upstream; o verdict decide se ele segue (e a fase de resposta é
+  re-observada — ver abaixo).
+
+```mermaid
+flowchart TD
+    SRC["Source (tail/syslog/pcap/CF/edge)"]
+    DD{"Dedupe LRU\nTTL dedupe_ttl_secs"}
+    TR{"IP trusted ou\nblacklist?"}
+    BOT["Verificação rDNS de bot (anota)"]
+    RULES["Rules engine\nAllow > Block/Challenge/RateLimit > Log/Tag"]
+    HEUR["Heurísticas\nURL-decode + prefilter Aho-Corasick"]
+    REP["Sinais de reputação (feeds)"]
+    ROUTE["Validação de rotas\nUnknownRoute / MethodNotAllowed"]
+    PEND["Drena sinais pendentes\nda fase de resposta (F3.9.1)"]
+    TRACK["Trackers: scan, behavior, upload flood"]
+    CORR["Correlação scan→ataque cross-IP"]
+    SCORE["Scorer: soma de pesos + repetição\ncap 100"]
+    POL["Policy override\n[[policy.override]]"]
+    ESC["Escalada de reincidentes\nstrikes → challenge/block"]
+    FORK["Forks async: AI ONNX, LLM, ip_lookup\nrescore_from — só eleva"]
+    DEC["Decision → actions"]
+    LANE["Lanes: inline (contenção local)\nou deferred (workers de rede)"]
+    PERS["Persistência em lote\n+ sampling sob overload"]
+
+    SRC --> DD --> TR
+    TR -->|"caso contrário"| BOT --> RULES
+    RULES -->|"short-circuit"| DEC
+    RULES -->|"Log/Tag: continua"| HEUR --> REP --> ROUTE --> PEND --> TRACK --> CORR --> SCORE --> POL --> ESC --> DEC
+    DEC -.->|"re-score"| FORK -.-> DEC
+    DEC --> LANE --> PERS
+```
+
+## Estágios em detalhe
+
+1. **Ingest + dedupe** — o loop do daemon drena o fan-in em lote
+   (`recv_many(64)`) e consulta uma LRU por hash `u64` do evento; GETs
+   idênticos dentro de `dedupe_ttl_secs` (10 s) morrem antes do pipeline.
+   Veja [`daemon.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs).
+2. **Guardas de confiança** ([`trust.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/trust.rs)) —
+   IPs em `trusted_ips` (never-ban) recebem Allow imediato; IPs na
+   `blacklist` levam Block antes de qualquer detector.
+3. **Bot verification** ([`botverify.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs), F7.7) —
+   UA que alega crawler é anotado com o resultado cacheado do rDNS
+   (verificado → bypass de challenge; falsificado → sinal `SpoofedBot`).
+4. **Rules engine** ([`rules.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs), [`packs.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs)) —
+   fast path. Precedência: `Allow` (bypass total) > `Block`/`Challenge`/
+   `RateLimit` (short-circuit) > `Log`/`Tag` (anota e continua). Packs
+   default: `sensitive_paths`, `honeypot_paths`, `crawlers_bad`,
+   `crawlers_good`, `empty_ua`, `http_anomaly`, `vpn_proxy`, `tor`,
+   `rate_scan`, `country_blocklist`, `host_allowlist`.
+5. **Heurísticas** ([`heuristics.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs)) —
+   SQLi/XSS/path traversal/LFI/Log4Shell/cmd injection/sensitive path/bad
+   crawler/UA vazio + scanners de upload (F10). Rodam sobre texto
+   URL-decodificado (`http_text`) com prefilter Aho-Corasick: tráfego
+   limpo executa **zero regex**.
+6. **Reputação** ([`reputation.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs)) —
+   `TorExitNode`, `KnownBadIp`, `VpnProxy`, `PromiscuousScanner` a partir
+   das feeds sincronizadas (F3.7).
+7. **Rotas** (validador em
+   [`pipeline.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs)) —
+   path fora da allowlist (config ∪ DB) → `UnknownRoute`; método não
+   permitido → `MethodNotAllowed`. Suporta exato, glob `/api/*` e
+   templates `/users/{id}`.
+8. **Fase de resposta** (F3.9.1) — sinais que dependem do status HTTP
+   (janelas 4xx) só existem depois da resposta. Na edge inline,
+   [`Pipeline::observe_response`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L737)
+   alimenta os trackers com o status real (upstream ou 403/429/301 da
+   própria edge) e enfileira os sinais (TTL 60 s, cap 16/IP); o próximo
+   request do mesmo IP os drena para o scoring. Sem isso, scanners em
+   tráfego inline ficariam para sempre em Allow.
+9. **Trackers de comportamento** —
+   [`ScanTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/scan.rs)
+   (≥ 8 paths 4xx distintos → `RandomScan`; ≥ 10 4xx → `ScanBehavior`),
+   [`BehaviorTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/behavior.rs)
+   (auth brute-force, credential stuffing, directory brute-force,
+   suspicious login success) e
+   [`UploadTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/uploads.rs)
+   (flood de volume, F10).
+10. **Correlação** ([`correlation.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/correlation.rs), F3.10) —
+    scan de um IP + ataque de **outro** IP no mesmo /24, /64 ou ASN dentro
+    da janela → `ScanAttackCorrelation`.
+11. **Scorer + policy + escalada** — soma dos pesos (cap 100) com bônus de
+    repetição, [`VerdictPolicy`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/policy.rs)
+    (mapping nível→verdict + overrides DSL) e
+    [`OffenderTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/offender.rs)
+    (strikes sobem o verdict). Detalhes em
+    [Níveis de Risco](/pt/architecture/risk-levels).
+12. **Forks assíncronos** — modelo ONNX, LLM e lookup externo de IP rodam
+    fora do caminho quente e re-entram por
+    [`rescore_from`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L1005):
+    **só elevam** score/verdict, nunca rebaixam. IPs never-ban são
+    imunes.
+13. **Actions em duas lanes** (F5) — contenção local (blocklist, log,
+    firewall) roda inline no loop de ingest; actions de rede (Cloudflare,
+    nginx, OPNsense, webhook, report) vão para workers postergados. Sob
+    overload a fila de actions enche primeiro: caem **actions**, nunca
+    eventos (`sentry_action_queue_drops_total`).
+14. **Persistência** — worker dedicado escreve em lote (um multi-INSERT
+    por `recv_many`); eventos de segurança caem para escrita direta se a
+    fila encher; eventos benignos são coalescidos/amostrados sob pressão.
+    Ver [Performance](/pt/architecture/performance).
+
+## Edge inline: o que muda
+
+No modo inline o request entra pela edge **antes** do upstream:
+
+```mermaid
 sequenceDiagram
-    participant N as Nginx (log)
-    participant I as Ingestor
+    participant C as Cliente
+    participant E as sentry-edge
     participant P as Pipeline
-    participant H as Heurísticas
-    participant A as IA (ONNX)
-    participant R as Roteiro (rotas válidas)
-    participant S as Scorer
-    participant D as Decisor
-    participant CF as Cloudflare API
-    participant DB as SQLite
+    participant U as Upstream
 
-    N->>I: linha de access_log
-    I->>I: parse + normalizar p/ Event
-    I->>P: Event
-    par fan-out paralelo
-        P->>H: regex/sigs (SQLi, XSS, LFI...)
-        P->>A: payload suspeito? embeddings
-        P->>R: path existe? método permitido?
-    end
-    H-->>S: signals + pesos
-    A-->>S: score anomalia
-    R-->>S: -delta se rota inválida
-    S->>S: combinar → risk_score + level
-    S->>D: AnalysisResult
-    D->>D: aplicar política (ex: High+IP novo = Challenge)
-    alt Decision == Block
-        D->>CF: firewall_rules: block IP
-        D->>DB: registrar incidente
-    else Decision == Challenge
-        D->>CF: challenge IP (JS/Turnstile)
-    else Allow
-        D->>DB: métricas only
-    end
-    D-->>N: (não interfere no nginx na fase 1; modo inline no futuro)
-`} />
+    C->>E: request
+    E->>E: fast-path BlockTable (403 sem evento)
+    E->>E: challenge gate (PoW / delega CF)
+    E->>E: inspeciona corpo (uploads, F10)
+    E->>P: Event (request phase, status ainda None)
+    P-->>E: verdict (Allow segue, resto vira 403/429/challenge)
+    E->>U: proxy do request
+    U-->>E: resposta
+    E->>P: observe_response (status real → trackers 4xx)
+    E->>E: compressão (se negociada)
+    E-->>C: resposta
+```
 
-## Detecção de rotas válidas
-
-1. **Discovery controlado**: o usuário fornece rotas válidas via config
-   (allowlist) **ou** o Sentry aprende em modo `learn` (período de baseline
-   sem ataques).
-2. Estrutura: trie de paths com métodos permitidos + parâmetros esperados.
-3. Sinais derivados:
-   - Rota inexistente → +pontos (scan/directory brute-force).
-   - Muitos 404 do mesmo IP em janela → scan behavior.
-   - Hits em paths sensíveis (`/.env`, `/wp-admin`, `/api/admin`) mesmo
-     inexistentes → peso alto.
-4. Saída: relatório `sentry routes` mostrando rotas conhecidas vs. tentadas.
-
-## Integração Cloudflare (sinergia de challenge)
-
-<Mermaid chart={`
-flowchart LR
-    EVT[Evento High/Critical] --> CF1{Cloudflare habilitado?}
-    CF1 -->|sim| CF2[Resolver zona+IP]
-    CF2 --> CF3{Já bloqueado recentemente?}
-    CF3 -->|não| CF4[Criar/Atualizar firewall rule]
-    CF3 -->|sim| CF5[Estender TTL]
-    CF4 --> CF6["Challenge mode: js_challenge / managed_challenge / block"]
-    CF6 --> CF7[Webhook confirmação]
-    CF1 -->|não| BL[Blocklist local only]
-`} />
-
-- Tokens via env (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
-- Cache local de IPs já desafiados (TTL configurável) para não bombardear a API.
-- Modos: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
-- **O default é o modo passive**: sources read-only + action Cloudflare.
-  Para enforcement inline de verdade, `[deployment] mode = "inline"` sobe o
-  reverse proxy `sentry-edge` na frente da app (verdict aplicado antes do
-  proxy), e IPs bloqueados são negados por um fast-path antes do pipeline —
-  veja a seção de modos de deployment da documentação de arquitetura.
+- Verdicts de contenção são espelhados no `ip_state` + `NOTIFY
+  sentry_blocks_changed`, então o fast-path nega o IP **antes** do
+  pipeline em todos os nós.
+- Eventos chegam ao fan-in como `Incoming::Processed` (verdict pronto);
+  o daemon só persiste e despacha actions.
+- Detalhes completos (TLS, challenge, error pages, compressão) em
+  [Edge Inline](/pt/architecture/edge-inline).

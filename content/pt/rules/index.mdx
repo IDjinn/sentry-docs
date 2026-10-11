@@ -1,123 +1,217 @@
 ---
 title: "Rules Engine"
-description: "Motor de regras determinístico WAF-style"
+description: "Motor de regras determinístico WAF-style — fast path antes de heurísticas e IA"
 ---
 
 # Rules Engine
 
 O Sentry tem um **motor de regras determinístico** que roda **antes** das
-heurísticas e da IA — é o "fast path". Inspirado nas Custom Rules / WAF da
-Cloudflare: cada regra é um *match* + *action*, avaliada em ordem de
-prioridade, com **short-circuit**. Regras são a primeira linha de defesa
-(bloqueio instantâneo de VPNs, crawlers, ASNs, países) e também a fonte de
-**allowlists** (IPs/ASNs confiáveis que bypassam todo o scoring).
+heurísticas e da IA — é o "fast path" do
+[`Pipeline::process`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L465).
+Inspirado nas Custom Rules / WAF da Cloudflare: cada regra é um *match* +
+*action*, avaliada em ordem de prioridade crescente, com **short-circuit**.
+Regras são a primeira linha de defesa (bloqueio instantâneo de scanners,
+Tor, VPN/proxy, países) e também a fonte de **allowlists** (IPs/ASNs
+confiáveis que bypassam todo o scoring).
 
-## Modelo
+## Semântica de avaliação
+
+O [`RuleSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L188)
+mantém as regras ordenadas por `priority` (menor = avalia primeiro) e
+[`evaluate_with`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L326)
+retorna o **primeiro match**. O que acontece depende da
+[`RuleAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L126):
+
+| Action                          | Efeito                                                        |
+|---------------------------------|---------------------------------------------------------------|
+| `Allow`                         | **Short-circuit**: bypass total de scoring e IA (allowlist).   |
+| `Block` / `Challenge` / `RateLimit` | **Short-circuit**: executa a contenção e encerra o pipeline. |
+| `Log`                           | Anota o evento (`RuleHit` peso 0) e **continua** para heurísticas + IA. |
+| `Tag`                           | Idem `Log`: anota e deixa fluir.                              |
+
+Ordem resumida:
+
+```text
+Evento normalizado
+  └─ Rules Engine (por prioridade; primeiro match vence)
+       ├─ Allow                     → Allow + bypass de scoring/AI
+       ├─ Block/Challenge/RateLimit → contenção imediata (short-circuit)
+       ├─ Log/Tag                   → anota e continua
+       └─ nenhum match              → heurísticas → reputation → routes
+                                      → scorer → policy → decider
+```
+
+Um short-circuit de `Block`/`Challenge`/`RateLimit` gera um sinal
+[`RuleHit`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L535)
+com peso fixo por verdict (Block 100, Challenge 50, RateLimit 30) e respeita
+a guard de never-ban (`[real_ip] trusted_ips`) e o flag
+[`cap_shadow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L782)
+— IPs em shadow-list são analisados mas nunca banidos. A verbosidade no
+console do evento short-circuitado é controlada por `log_level` na regra
+(`silent` suprime a linha; o evento continua sendo armazenado e despachado).
+
+## Tipos principais
+
+Definidos em
+[`crates/sentry-core/src/rules.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs).
+
+**[`Rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L155)** — uma regra individual:
 
 ```rust
-// sentry-core/src/rules.rs
 pub struct Rule {
     pub id: RuleId,
     pub name: String,
-    pub priority: i32,              // menor = avalia primeiro
+    pub priority: i32,
     pub enabled: bool,
-    pub match_: RuleMatch,          // condição (combinável com AND/OR)
+    pub match_: RuleMatch,
     pub action: RuleAction,
-    pub ttl: Option<Duration>,      // regras dinâmicas expiram (ex: block temporário)
-    pub source: RuleSource,         // Config | Db | CloudflareSync | AutoLearned
-    pub tags: Vec<String>,          // ex: "default", "vpn", "crawler"
+    pub ttl: Option<Duration>,
+    pub source: RuleSource,
+    pub tags: Vec<String>,
+    pub log_level: Option<RuleLogLevel>,
 }
-
-pub enum RuleAction {
-    Allow,                          // bypassa scoring + AI (allowlist absoluta)
-    Block,
-    Challenge,                      // Cloudflare managed/js challenge
-    RateLimit { req_per_sec: u32, window: Duration },
-    Log,                            // só registra, não age (modo shadow)
-    Tag(String),                    // anota o evento, continua pipeline
-}
-
-// Expressões combináveis — mesma ideia de matchers da CF
-pub enum RuleMatch {
-    Ip(IpMatcher),                 // IP exato | CIDR | range
-    Asn(u32),
-    Country(IsoCode),
-    Path(PathMatcher),             // exato | glob | regex
-    Method(HttpMethod),
-    Header { name: String, op: StrOp },
-    UserAgent(StrOp),
-    Query(StrOp),
-    Body(StrOp),                   // quando disponível
-    Protocol(ProtocolKind),        // Http | Tcp | Tls...
-    TlsFingerprint { ja3: Option<String>, ja4: Option<String> },
-    Reputation(ReputationTier),    // Clean | Suspicious | Malicious | Datacenter | Vpn | Tor
-    Status(u16),                   // ex: status == 404
-    Rate { count: u32, per: Duration, scope: RateScope },
-    Time { window: TimeWindow },   // só ativa em horário comercial etc.
-    All(Vec<RuleMatch>),           // AND
-    Any(Vec<RuleMatch>),           // OR
-    Not(Box<RuleMatch>),
-}
-
-pub enum IpMatcher { Single(IpAddr), Cidr(IpCidr), Range { from: IpAddr, to: IpAddr } }
-pub enum StrOp { Equals(String), Contains(String), Regex(Regex), StartsWith(String), In(Vec<String>) }
 ```
 
-## Precedência no pipeline
+- `ttl` expira regras dinâmicas (blocks temporários; o reaper do Cloudflare
+  usa o mesmo formato `sentry:<ts>:<ttl>`).
+- `log_level` controla a verbosidade da linha no console (`silent`, `info`,
+  `warn`, `error`).
+- O id de regras de config é um slug ASCII estável do nome
+  (`allow_internal_monitoring`).
 
-<Mermaid chart={`
-flowchart LR
-    EVT[Evento normalizado] --> R{Rules Engine<br/>avalia em prioridade}
-    R -->|Allow rule hit| BY[Allow + bypass scoring/AI]
-    R -->|Block/Challenge/RateLimit hit| ACT[Executa Action<br/>+ short-circuit]
-    R -->|Log/Tag hit| AN[Anota + continua]
-    R -->|nenhuma regra| HEUR[Heurísticas → IA → Scorer]
-    BY --> PERSIST[Persistir]
-    ACT --> PERSIST
-    AN --> HEUR
-    HEUR --> PERSIST
-`} />
+**[`RuleAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L126)** — `Allow | Block | Challenge | RateLimit | Log | Tag`.
 
-Ordem: **Allowlist** (trust absoluto) > **Blocklist explícita** >
-**Reputation/VPN/Tor defaults** > **Crawler/UA defaults** > **path
-sensíveis** > (cai para heurísticas+IA). Allowlist é o *escape hatch* para
-evitar falso-positivo em IPs próprios (healthchecks, monitoring, CI).
+**[`RuleSource`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L108)** — origem da regra:
+
+| Variante         | Origem                                                            |
+|------------------|-------------------------------------------------------------------|
+| `Config`         | `[[rules.custom]]` no `sentry.toml`.                               |
+| `Db`             | Criada via CLI/dashboard, persistida no Postgres.                  |
+| `CloudflareSync` | Espelho de regras vivas do edge Cloudflare (reconcile no startup). |
+| `Feed`           | Gerada pelo importador de reputation feeds/datasets (`feed:<name>`). |
+| `AutoLearned`    | Auto-block com TTL derivado de incidentes confirmados.             |
+| `DefaultPack`    | Pack default embutido.                                             |
+
+**[`RuleMatch`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L358)** — a condição (árvore combinável `All`/`Any`/`Not`).
+A referência completa das condições e da sintaxe textual está na página
+[DSL de Match](/pt/rules/dsl).
+
+**[`RuleSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L188)** — conjunto compilado e ordenado por prioridade, com
+[`replace_by_prefix`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L307)
+para troca atômica de grupos de regras (usado no hot-reload de datasets).
+
+**`SharedRuleSet`** — alias `Arc<RwLock<RuleSet>>`
+([definição](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L198)):
+o daemon compartilha o mesmo handle com pipeline, edge inline e CLI; o
+hot-reload troca o conjunto interno com `write()` e a avaliação lê com
+`read()`.
 
 ## Fontes de regras
 
-1. **Config (`sentry.toml`)** — regras estáticas, versionadas com o app.
-2. **Postgres (`rules` table)** — regras dinâmicas criadas via CLI/dashboard,
-   hot-reload sem reiniciar.
-3. **Cloudflare sync** — importa Custom Rules/WAF da CF como regras locais
-   (espelho) para decisão local em modo inline futuro.
-4. **Auto-learned** — IPs confirmados como maliciosos pelo decisor viram
-   regra dinâmica `Block` com TTL (feedback loop).
-5. **Reputation feeds** — blocklists públicas (Spamhaus DROP, Emerging
-   Threats, FireHOL) sincronizadas periodicamente → viram regras `Block`
-   tagadas `feed:spamhaus`.
+1. **Config (`sentry.toml`)** — [`[[rules.custom]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1948)
+   compiladas por
+   [`rules_from_config`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L210):
+   uma expressão DSL inválida derruba **só aquela regra** (com o nome no
+   erro), não o config inteiro.
+2. **Postgres (tabela `rules`)** — regras dinâmicas criadas via CLI
+   (`sentry rules add/allow/block`) ou dashboard.
+3. **Packs default** — ver [Default Rule Packs](/pt/rules/packs).
+4. **Reputation feeds e datasets** — regras sintéticas `feed:<name>`
+   (prioridade 50) geradas por
+   [`feed_rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L210)
+   (IP, quando a feed declara `action`) e
+   [`dataset_rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L274)
+   (`user_agent`/`path`/`ja3`).
+5. **Cloudflare sync** — o reconcile do startup adota regras vivas do edge
+   como espelho local (`CloudflareSync`).
+6. **Auto-learned** — escalada de reincidentes persistida no `ip_state`.
 
-Hot-reload: o daemon observa a tabela `rules` (Postgres `LISTEN/NOTIFY`) e
-atualiza um `Arc<RwLock<RuleSet>>` em memória sem restart. Avaliação é
-indexada por IP-hash/ASN/country para não iterar todas as regras por evento.
+## Hot-reload
+
+- **`sentry_rules_changed`** — task
+  [`rules_hot_reload`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2775)
+  faz `LISTEN` no canal Postgres, recarrega o ruleset do banco e troca o
+  `Arc<RwLock<RuleSet>>` sem restart. CLI/dashboard emitem o `NOTIFY`.
+- **`sentry_datasets_changed`** — task
+  [`datasets_hot_reload`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2877)
+  reconstrói as regras com prefixo `dataset:` via `replace_by_prefix`
+  (troca atômica, all-or-nothing) e atualiza os literais do prefilter.
+- O Postgres é a fonte da verdade: um nó que sobe depois carrega o ruleset
+  do banco no startup.
+
+## Caches de performance (F5)
+
+- **Cache de regex**
+  ([`REGEX_CACHE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L34))
+  e **cache de IP-spec**
+  ([`IP_CACHE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L74))
+  de processo: padrões compilados 1× (o código antigo compilava regex por
+  regra por evento — ~3,4 ms/evento). Patterns inválidos são cacheados
+  como `None` para não re-parsear por evento.
+- **Prefilter Aho-Corasick** — as heurísticas só rodam a regex da família
+  quando um literal aparece no texto
+  ([`PREFILTER`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L289),
+  um `ArcSwap`); datasets `user_agent`/`path` entram nesse gate via
+  [`reload_dataset_lists`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L296),
+  junto com
+  [`SENSITIVE_PATH_RE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L537)
+  e
+  [`BAD_CRAWLER_RE`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L540).
+- **Decode-once** — o path URL-decodificado é computado 1× por avaliação
+  ([`EvalCtx`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L722))
+  e compartilhado por todas as condições `path`; regras nunca são burladas
+  por encoding (`%2e%2e%2f` = `../`, `+` = espaço —
+  [`url_decode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L773)).
+
+## Empacotamento de config
+
+Packs default são declarados assim:
+
+```toml
+[[rules.pack]]
+name = "vpn_proxy"
+mode = "shadow"          # shadow | enforce | off
+
+[[rules.pack]]
+name = "country_blocklist"
+mode = "enforce"
+
+[rules.pack.params]
+countries = ["RU", "CN"]
+```
+
+Cada pack vira um par de chaves no mapa de modos e cada param é **achatado**
+como `<pack>__<param>` (ex.: `country_blocklist__countries`) antes de ir ao
+builder —
+[wiring no daemon](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L154).
+Esse achatamento (F7.6) corrigiu o bug em que params de pack nunca chegavam
+ao builder. Só valores string e arrays de string são renderizados. Os
+params lidos hoje são `country_blocklist__countries` e
+`host_allowlist__domains`
+([`pack_list_param`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L166)).
 
 ## CLI de gestão de regras
 
 ```bash
-sentry rules list [--tag vpn] [--enabled] [--source db|config|feed]
+sentry rules list                                  # lista regras ativas
 sentry rules show <id>
 sentry rules add --name "block admin from RU" \
     --match 'country=RU AND path=/admin/*' --action block --priority 10
 sentry rules allow <ip> [--ttl 24h] [--note "monitoring agent"]
 sentry rules block <ip> [--ttl 24h] [--note "scan"]
-sentry rules allow-asn <asn> [--note "our DC"]
-sentry rules block-asn <asn>
-sentry rules enable <id>
-sentry rules disable <id>
-sentry rules delete <id>
-sentry rules import-feed spamhaus      # sincroniza reputation feed
-sentry rules packs list                # mostra packs e estado (shadow/enforce/off)
-sentry rules packs enable vpn_proxy --mode enforce
-sentry rules packs disable crawlers_good
-sentry rules test <ip>                 # simula: quais regras bateriam neste IP agora
-sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
+sentry rules enable <id> | disable <id> | delete <id>
+sentry rules packs                                 # estado dos packs default
+sentry rules test --path /admin --method GET --ip 1.2.3.4 --ua "sqlmap/1.0"
 ```
+
+`sentry rules test` avalia a expressão de match contra um evento hipotético
+— use para validar regras antes de promover para `enforce`. As ações
+`allow`/`block` por IP gravam no Postgres e emitem `NOTIFY`, então nós em
+execução recarregam sem restart.
+
+## Próximos passos
+
+- [DSL de Match](/pt/rules/dsl) — sintaxe completa das condições.
+- [Default Rule Packs](/pt/rules/packs) — catálogo atual dos packs.
+- [Shadow vs Enforce](/pt/rules/shadow-vs-enforce) — rollout seguro e
+  política de verdicts.

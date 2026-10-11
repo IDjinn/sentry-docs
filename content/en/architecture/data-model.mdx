@@ -1,135 +1,108 @@
 ---
 title: "Data Model"
-description: "Event, ProtocolData and protocol helpers"
+description: "Event, ProtocolData, HttpData and uploads — Sentry's central contract"
 ---
 
 # Data Model
 
-The `Event` is **modular by design**: fields common to any source live at
-the top level; protocol-specific fields live in `ProtocolData` (an extensible
-enum). Today `Http` covers nginx; tomorrow `Tcp`, `Udp`, `Tls` etc. can be
-added without changing the core — the source just populates the corresponding
-variant. Heuristics and the scorer operate on the `Event` and pattern-match
-on `protocol`, ignoring absent fields.
+The [`Event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L198)
+is **modular by design**: fields common to every origin live at the
+top level; protocol specifics live in the
+[`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396)
+enum. Heuristics, rules and the scorer pattern-match on the accessor
+helpers and return early for variants they don't handle — no pipeline stage
+may assume an event is HTTP.
+
+## Event (top level)
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `Uuid` | Stable unique event id |
+| `timestamp` | `DateTime<Utc>` | Observation time (ingest time, not log time) |
+| `source` | [`SourceKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L19) | `Nginx`, `HttpProxy`, `Tcp`, `CloudflareLogs`, `Syslog`, `EdgeTls`, `Synthetic` |
+| `transport` | [`Transport`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L61) | `Tcp`, `Udp`, `Quic`, `Internal` |
+| `direction` | [`Direction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L75) | `Inbound` or `Outbound` |
+| `client_ip` | `IpAddr` | Client IP, always canonical (IPv4-mapped becomes plain IPv4) |
+| `client_port` / `server_port` | `Option<u16>` | Source port and observed listening port |
+| `geo` | `Option<GeoInfo>` | Country/subdivision/city/lat/lon (MaxMindDB, filled by the ingestor) |
+| `asn` | `Option<u32>` | Autonomous system number of the client IP |
+| `reputation` | `Option<ReputationInfo>` | Tier + matching feed (F3.7, filled by the ingestor) |
+| `bot` | `Option<BotStatus>` | rDNS crawler-verification outcome (F7.7, filled by the pipeline) |
+| `bytes_in` / `bytes_out` | `Option<u64>` | Bytes received/sent |
+| `duration_ms` | `Option<u64>` | Request/response duration when known |
+| `raw` | `Option<String>` | Original record (log line, syslog message) for audit |
+| `protocol` | [`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396) | Protocol-specific payload |
+
+A source produces a thin
+[`RawEvent`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L338);
+the ingestor promotes it to `Event` and fills geo/ASN/reputation.
+
+## ProtocolData (protocol enum)
+
+| Variant | Payload | Description |
+| --- | --- | --- |
+| `Http(HttpData)` | [`HttpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L413) | HTTP/1.x or HTTP/2 request observation (nginx, proxy syslog, inline edge) |
+| `Tcp(TcpData)` | [`TcpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L484) | Non-HTTP TCP stream observation: flags, reassembled payload, `stream_id`, stage, SYN fingerprint (`window:options:MSS:wscale`) and `syn_count` (burst aggregation, F5) |
+| `Udp(UdpData)` | [`UdpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L541) | UDP datagram; `dns_query` when it looks like DNS |
+| `TlsHandshake(TlsData)` | [`TlsData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L550) | ClientHello: `sni`, `ja3`, `ja4`, `cipher`, `version`, `alpn` (F8) |
+| `Syslog(SyslogData)` | [`SyslogData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L577) | RFC 5424 message (RFC 3164 fallback): facility, severity, hostname, app-name, message |
+| `Raw(RawData)` | [`RawData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L568) | Fallback for protocols without a dedicated variant |
+
+## HttpData (key fields)
+
+| Field | Description |
+| --- | --- |
+| `method` | `Option<HttpMethod>` — typed enum (`Get`, `Post`, …, `Other`) |
+| `scheme` / `host` | `http`/`https` and the `Host` header value |
+| `path` / `query` / `fragment` | Path without query, raw query string, fragment |
+| `status` | Response status code when observed (inline edge and proxy fill it) |
+| `user_agent` / `referer` | Identification headers |
+| `headers` | Every header captured by the source (`http_*` log_format tokens become `kebab-case` keys, enabling `header.X` DSL rules) |
+| `body` | Request body bytes when the source is inline (bounded by `body_capture_kb`) |
+| `cookies` | Parsed cookies (populated by the edge) |
+| `uploads` | `Option<Vec<UploadInfo>>` — uploaded file metadata (F10); content never persists |
+| `upstream_time_ms` | `$upstream_response_time` (F12, first value of lists) |
+
+## UploadInfo / UploadKind (F10)
+
+[`UploadInfo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L450)
+carries `field_name`, `filename`, `content_type`, `size` and `kind`.
+[`UploadKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L466)
+classifies by **magic bytes** (the client declaration is only a hint):
+`Text`, `Image` (PNG/JPEG/GIF/WebP/BMP), `Archive` (ZIP/gzip/bzip2),
+`Executable` (MZ/ELF/Mach-O/shebang), `Pdf`, `Unknown`.
+
+## Accessor helpers
 
 ```rust
-// sentry-core/src/event.rs
-pub struct Event {
-    // --- common to any protocol ---
-    pub id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    pub source: SourceKind,          // Nginx, Tcp, HttpProxy, CloudflareLogs...
-    pub transport: Transport,        // Tcp | Udp | Tls | Internal
-    pub client_ip: IpAddr,
-    pub client_port: Option<u16>,
-    pub server_port: Option<u16>,    // exposed port observed
-    pub geo: Option<GeoInfo>,
-    pub asn: Option<u32>,
-    pub direction: Direction,        // Inbound | Outbound
-    pub bytes_in: Option<u64>,
-    pub bytes_out: Option<u64>,
-    pub duration_ms: Option<u64>,
-    pub raw: Option<String>,         // original record for audit
-
-    // --- protocol-specific ---
-    pub protocol: ProtocolData,
-}
-
-pub enum ProtocolData {
-    Http(HttpData),
-    Tcp(TcpData),
-    Udp(UdpData),
-    TlsHandshake(TlsData),
-    Raw(RawData),                    // fallback: bytes + note
-    // future variants land here without breaking consumers
-}
-
-pub struct HttpData {
-    pub method: HttpMethod,
-    pub scheme: Option<String>,      // http | https
-    pub host: Option<String>,
-    pub path: String,
-    pub query: Option<String>,
-    pub fragment: Option<String>,
-    pub status: Option<u16>,
-    pub user_agent: Option<String>,
-    pub referer: Option<String>,
-    pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,       // when available (proxy/middleware)
-    pub cookies: Option<HashMap<String, String>>,
-}
-
-pub struct TcpData {
-    pub flags: TcpFlags,             // syn/fin/rst/ack...
-    pub payload: Option<Vec<u8>>,    // reconstructed stream bytes (when capturable)
-    pub stream_id: Option<u64>,      // to correlate segments
-    pub stage: TcpStage,             // Syn | SynAck | Data | Fin | Reset
-}
-
-pub struct UdpData {
-    pub payload: Option<Vec<u8>>,
-    pub dns_query: Option<String>,   // if recognized as DNS
-}
-
-pub struct TlsData {
-    pub sni: Option<String>,
-    pub ja3: Option<String>,         // TLS fingerprint
-    pub ja4: Option<String>,
-    pub cipher: Option<String>,
-    pub version: Option<String>,
-}
-
-pub struct RawData {
-    pub note: String,
-    pub bytes: Vec<u8>,
-}
-
-// Ergonomic helpers: e.kind_http() -> Option<&HttpData> etc.
 impl Event {
-    pub fn http(&self)  -> Option<&HttpData>  { match &self.protocol { ProtocolData::Http(d) => Some(d), _ => None } }
-    pub fn tcp(&self)   -> Option<&TcpData>   { match &self.protocol { ProtocolData::Tcp(d) => Some(d), _ => None } }
-    pub fn tls(&self)   -> Option<&TlsData>   { match &self.protocol { ProtocolData::TlsHandshake(d) => Some(d), _ => None } }
-    pub fn is_http(&self) -> bool { matches!(self.protocol, ProtocolData::Http(_)) }
+    pub fn http(&self) -> Option<&HttpData>
+    pub fn tcp(&self) -> Option<&TcpData>
+    pub fn tls(&self) -> Option<&TlsData>
+    pub fn syslog(&self) -> Option<&SyslogData>
+    pub fn protocol_kind(&self) -> ProtocolKind
 }
 ```
 
-> **Rule**: no pipeline stage may assume `ProtocolData::Http`. HTTP heuristics
-> check `evt.http()` and return `None` for other variants; TCP heuristics do
-> the analog. This way the same pipeline runs for nginx today and TCP capture
-> tomorrow.
+DSL rules use `protocol_kind()` for protocol conditions
+([`ProtocolKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L85):
+`Http`, `Http3`, `Tcp`, `Udp`, `Tls`, `Other`).
 
-## AnalysisResult
+## Golden rule: adding a new protocol
 
-```rust
-pub struct AnalysisResult {
-    pub risk_score: u8,               // 0..=100
-    pub risk_level: RiskLevel,        // Info|Low|Medium|High|Critical
-    pub signals: Vec<Signal>,         // what fired
-    pub verdict: Verdict,             // Allow|Challenge|Block|Quarantine
-}
-
-pub enum Signal {
-    PathTraversal, SqlInjection, Xss, CmdInjection,
-    UnknownRoute, ScanBehavior, AbnormalRate,
-    SuspiciousUA, TorExitNode, KnownBadIp,
-    AnomalousPayload(/* model */),
-    Custom(String),
-}
-```
-
-## Adding a new protocol
-
-When adding a new protocol:
-
-1. Add a variant to `ProtocolData`.
+1. Add a variant to
+   [`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396).
 2. Add a helper on `impl Event` (e.g. `pub fn my_proto(&self) -> Option<&MyData>`).
 3. Update `protocol_kind()`.
-4. **Do not** add loose fields to the top-level `Event` — put them in the enum.
+4. **Never** add loose fields to the `Event` top level — put them in the enum.
+
+Old consumers keep compiling (they simply ignore the new variant) and the
+same pipeline serves nginx today and TCP/TLS tomorrow.
 
 ## Encoding normalization (heuristics)
 
-Heuristics (SQLi, XSS, path traversal, etc.) run on the **URL-decoded** form
-of the path/query (`heuristics::http_text`), so that encoded payloads
-(`%27` = `'`, `+` or `%20` = space) cannot bypass them. When writing new
-heuristics, always use `http_text(http)` instead of reading `http.path` /
-`http.query` directly.
+Heuristics (SQLi, XSS, path traversal, etc.) run over the
+**URL-decoded** form of path/query (`heuristics::http_text`), so encoded
+payloads (`%27` = `'`, `+` or `%20` = space) cannot bypass detection. When
+writing new heuristics, always use `http_text(http)` instead of reading
+`http.path` / `http.query` directly.

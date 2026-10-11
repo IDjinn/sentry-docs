@@ -1,30 +1,33 @@
 ---
 title: "Sentry"
-description: "Monitor de acessos em tempo real com detecção de ameaças por IA"
+description: "Monitor de acessos em tempo real e WAF de edge inline com detecção de ameaças por IA"
 ---
 
 # Sentry
 
-O **Sentry** é um observador de acessos em tempo real para serviços expostos à internet. Começa monitorando o **nginx** (via access logs), mas é desenhado para escalar para **qualquer porta/protocolo** (HTTP, TCP, proxies reversos, packet capture, syslog). Usa IA + heurísticas para detectar payloads maliciosos, comportamento suspeito, rotas inválidas e calcula um **nível de risco** por requisição/IP. Integra-se com **Cloudflare** para challenge/block em camada de edge.
+O **Sentry** é um monitor de acessos e **WAF de edge inline** em tempo real para serviços expostos à internet. Em modo passivo observa nginx (access logs), syslog, Cloudflare Logs API e captura TCP; em modo inline ele vira o reverse proxy na frente da aplicação (HTTP 80/443 com TLS, HTTP/2, challenge PoW e inspeção de corpo). Usa regras + heurísticas + IA para detectar payloads maliciosos, comportamento suspeito e rotas inválidas, calcula um **nível de risco** por requisição/IP e age: block, challenge, rate-limit, ban de kernel, webhook.
 
 ## Características principais
 
-- **Modularidade total**: cada origem de dados (nginx, tcp, http-proxy) é um plugin por trás de um trait comum.
-- **Tempo real**: stream de eventos, não batch.
-- **Precisão**: combinar regras determinísticas (rápidas, zero falso-positivo conhecido) com IA (para o desconhecido).
-- **Ação**: não apenas detectar — bloquear, desafiar, rate-limitar.
-- **Multi-plataforma**: um único binário em Rust.
-- **Operável**: CLI rica para tail ao vivo, relatórios, export, gestão de blocklist.
+- **WAF inline**: reverse proxy [`axum`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge) com veredito **antes** do proxy (Block→403, RateLimit→429, Challenge→página PoW), fast-path de bloqueio por IP e block table compartilhada entre nós.
+- **TLS 443 + JA3/JA4**: terminação HTTPS, telemetria de ClientHello (fingerprint JA3/JA4, SNI, ALPN) e HTTP/2 via ALPN.
+- **Multi-source**: plugins para nginx, syslog (RFC 5424/3164), Cloudflare Logs, captura TCP com fingerprint de scanners e protocolos não-HTTP via schemas YAML ([`sentry-protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol)).
+- **Detecção em camadas**: rules engine determinístico (DSL + packs) → heurísticas com URL-decode → IA local ONNX → LLM opcional (OpenRouter/Ollama), com escalonamento de reincidentes e correlação scan→ataque cross-IP.
+- **Ação em toda a pilha**: Cloudflare (block/challenge/rate-limit, IPv6 /64), bans de kernel (nftables/ipset/firewalld), OPNsense/pfSense, nginx deny + challenge, webhooks assinados, report comunitário (AbuseIPDB).
+- **Operável**: dashboard web com auth Argon2id + RBAC, TUI ratatui, métricas Prometheus + Grafana, export SIEM (CEF/LEEF/syslog), modo serviço no OS.
+- **Hardening de honeypot**: `[real_ip]` com trusted proxies, verificação de bots por rDNS, datasets DB-backed com hot-reload, postura de headers (advisory).
+- **Rápido**: pipeline em ~4,36 µs/evento (~800× mais rápido que a v1), duas lanes de actions e degradação em tiers sob overload — detecção e contenção nunca degradam.
 
 ## Documentação
 
-- [Visão geral](./overview) — objetivos, não-objetivos, o que é o Sentry.
+- [Visão geral](./overview) — objetivos, não-objetivos, stack e status (F0–F12 concluídas).
 - [Início rápido](./quickstart) — Docker, build local, configuração básica.
 - [Arquitetura](./architecture) — pipeline, modelo de dados, fluxo de requisição.
-- [Rules Engine](./rules) — regras determinísticas, DSL, packs.
+- [Rules Engine](./rules) — regras determinísticas, DSL, packs, datasets.
 - [Plugins](./plugins) — traits `Source` e `Action`, challenge providers.
 - [IA](./ai) — heurísticas, ONNX local, LLM opcional.
 - [CLI & TUI](./cli) — referência de comandos e interface interativa.
 - [Configuração](./config) — referência do `sentry.toml`.
-- [Sentry Auto](./auto) — detecção de framework e geração automática de regras.
+- [Referência](./reference) — crates, módulos e tipos com links para o source.
+- [Exemplos](./examples) — configs de exemplo por cenário.
 - [Deploy](./deploy) — Docker, Kubernetes, Vercel.

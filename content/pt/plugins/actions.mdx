@@ -1,52 +1,279 @@
 ---
-title: "Trait de Action"
-description: "Plugins de ação — block, webhook, log"
+title: "Ações"
+description: "Plugins de resposta — o trait Action, ActionKind e as crates sentry-action-*"
 ---
 
-# Trait de Action
+# Ações
 
-Toda ação (block, challenge, webhook, log) é um plugin por trás do trait
-`Action`. O decisor invoca as actions registradas para um evento quando o
-veredito difere de `Allow`.
+Toda resposta (bloqueio, desafio, webhook, log) é um plugin por trás do
+trait [`Action`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/action.rs#L74).
+Quando o pipeline chega a uma
+[`Decision`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs),
+o decisor despacha para as actions registradas cujo `applies_to` aceitar o
+veredito. Erros são logados dentro da implementação — um webhook falhando
+não derruba o daemon.
 
 ```rust
-// sentry-core/src/action.rs
+/// A plugin that executes a response when a decision is reached.
 #[async_trait]
 pub trait Action: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn execute(&self, evt: &Event, decision: &Decision) -> anyhow::Result<()>;
+    async fn execute(&self, evt: &Event, decision: &Decision) -> Result<()>;
+    async fn execute_with_context(&self, evt: &Event, decision: &Decision, ctx: &ActionContext) -> Result<()>;
+    fn applies_to(&self, decision: &Decision) -> bool;
+    fn dispatch(&self) -> ActionDispatch;
 }
 ```
 
-## Implementações
-
-| Crate                          | Ação                          | Status  |
-|--------------------------------|-------------------------------|---------|
-| `sentry-action-cloudflare`     | Regras de firewall, challenge | Pronto  |
-| `sentry-action-blocklist`      | Alimenta a block table compartilhada; a edge inline nega IPs bloqueados antes do pipeline | Pronto  |
-| `sentry-action-webhook`        | Discord/Slack/Telegram/email  | Pronto  |
-| `sentry-action-iptables`       | nftables/iptables (Linux)     | Futuro  |
-| `sentry-action-log`            | Registrar em DB               | Pronto  |
-
 ## Type-safe via `ActionKind`
 
-O tipo de action em config é o enum `sentry_core::config::ActionKind`
-(`Cloudflare` | `Challenge` | `Webhook` | `Blocklist` | `Log`), **não** uma
-string. Erros de digitação em `type = "..."` no TOML falham em tempo de
-carga, não em runtime.
+O tipo de action na config é o enum
+[`ActionKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2103),
+**não** uma string — erros de digitação em `type = "..."` no TOML falham em
+tempo de carga. Cada `[[action]]` (o struct
+[`ActionConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2074)
+com `type`, `provider`, `dispatch` e `options`) vira um braço no `match` de
+[`daemon::build_registry`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L3189).
 
-## Actions de edge vs não-edge
+| Valor em TOML | Implementação | Efeito |
+| --- | --- | --- |
+| `challenge` | qualquer `ChallengeProvider` (via `provider = "..."`) | Edge action provider-agnostic |
+| `cloudflare` | [`sentry-action-cloudflare`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-cloudflare/src/lib.rs) | Alias legado de `challenge` + `provider = "cloudflare"` |
+| `webhook` | [`sentry-action-webhook`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-webhook/src/lib.rs) | POST de alerta JSON |
+| `blocklist` | [`sentry-action-blocklist`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-blocklist/src/lib.rs) | Blocklist local em memória |
+| `report` | [`sentry-action-report`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-report/src/lib.rs) | Report a bancos de abuso comunitários |
+| `log` (default) | [`LogAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L4000) (built-in) | Linha de tracing por decisão |
 
-- **Edge actions** (block/challenge/rate-limit em CDN/WAF): use a forma
-  canonical `type = "challenge"` + `provider = "cloudflare"`. O alias
-  `type = "cloudflare"` (sem `provider`) é equivalente e mantido por
-  compatibilidade.
-- **Actions não-edge** (webhook, blocklist, log): variante do `ActionKind` e
-  braço no `match` de `daemon::build_registry`.
+## Duas lanes: `inline` vs `deferred` (F5)
 
-## Registro no daemon
+O loop de ingest nunca espera I/O externo. O enum
+[`ActionDispatch`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/action.rs#L24)
+classifica cada action:
 
-Actions são montadas no `daemon::build_registry` a partir da config. Cada
-`[[action]]` no `sentry.toml` vira um braço no `match` que instancia o
-plugin correspondente. Adicionar uma nova action não-edge = adicionar
-variante ao `ActionKind` + braço no match.
+- **`inline`** — roda no hot path de ingest. Reservado para contenção
+  local e instantânea (blocklist, log, firewall de kernel).
+- **`deferred`** (default) — roda nos workers pós-processamento (providers
+  de API, webhooks, reports de abuso).
+
+Os defaults naturais (resolvidos em
+[`daemon::resolve_dispatch`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L3167)):
+`blocklist` e `log` rodam inline; `challenge` roda inline **apenas** com
+`provider = "firewall"`; cloudflare, nginx, opnsense, webhook e report
+deferram. Qualquer action pode sobrescrever com `dispatch = "inline" | "deferred"`:
+
+```toml
+[[action]]
+type = "webhook"
+dispatch = "inline"   # raro: move o POST para o hot path
+[action.options]
+url_env = "SENTRY_WEBHOOK_URL"
+```
+
+Sob overload a fila de actions deferradas enche primeiro — o sistema faz
+shed de **actions**, nunca de eventos
+(`sentry_action_queue_drops_total`).
+
+## `ActionContext`
+
+Entre o pipeline e o despacho o daemon popula o
+[`ActionContext`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/action.rs#L60)
+com `incident_id` (quando o evento escalou para um incidente no Postgres).
+Actions que se importam sobrescrevem `execute_with_context`; o webhook, por
+exemplo, inclui `incident_id` e `ack_url` no payload para round-trips de
+ack/resolve.
+
+## sentry-action-blocklist
+
+Num veredito `Block`, grava o IP na
+[`BlockTable`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/blocks.rs#L20)
+compartilhada pelo TTL configurado
+([`BlocklistAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-blocklist/src/lib.rs#L30)).
+É essa action que dá "dente" ao veredito no modo inline: o fast-path da
+edge nega IPs da tabela **antes** do pipeline. O daemon espelha os mesmos
+vereditos para o Postgres (`ip_state`) e notifica `sentry_blocks_changed`
+via LISTEN/NOTIFY — bloqueio num nó nega na edge de todos.
+
+```toml
+[[action]]
+type = "blocklist"
+[action.options]
+ttl_secs = 86400   # default 24 h (compartilhado com o espelho em ip_state)
+```
+
+## sentry-action-webhook
+
+POST de payload JSON para a URL configurada — Discord, Slack, Telegram ou
+endpoint próprio
+([`WebhookAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-webhook/src/lib.rs#L47)).
+URLs de Discord são automaticamente embrulhadas no formato de embeds da
+plataforma (que rejeita JSON arbitrário); todo outro endpoint recebe o
+payload cru.
+
+- **Assinatura HMAC**: com segredo configurado, cada request carrega
+  `X-Sentry-Signature: sha256=<hex hmac(segredo, body)>`. O segredo vem da
+  env apontada por `secret_env` (default `SENTRY_WEBHOOK_SECRET`).
+- **Alertas bidirecionais (F4.5)**: com incidente associado, o payload
+  inclui `incident_id` e `ack_url` — o receptor pode chamar de volta
+  `POST /api/incidents/{id}/ack` ou `/resolve`.
+- **Filtro de nível**: `on_levels` (default `["high", "critical"]`).
+- A URL é credencial: prefira `url_env` a `url` em texto plano. Timeout
+  default de 10 s.
+
+```toml
+[[action]]
+type = "webhook"
+[action.options]
+url_env = "SENTRY_WEBHOOK_URL"
+# on_levels = ["high", "critical"]
+# secret_env = "SENTRY_WEBHOOK_SECRET"
+```
+
+## sentry-action-cloudflare
+
+Provider de edge: converte vereditos `Block`/`Challenge`/`RateLimit` em
+regras na Cloudflare (IP Access Rules e, para IPv6, IP Lists). O `type =
+"cloudflare"` é o alias legado da forma canonical `type = "challenge"` +
+`provider = "cloudflare"` — detalhes de funcionamento (reconcile, reaper,
+circuit breaker, IPv6 /64) na página de
+[Challenge providers](/pt/plugins/challenge-providers).
+
+## sentry-action-firewall
+
+Bans de kernel (F7.3): aplica vereditos `Block`/`Challenge`/`RateLimit` no
+próprio host via
+[`FirewallProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-firewall/src/lib.rs#L482),
+com três backends auto-detectados nesta ordem:
+
+1. **nftables** (recomendado) — tabela dedicada com sets `flags timeout`
+   (o ban expira no kernel, sem reaper) e regra DROP no hook input.
+2. **ipset** — sets `hash:ip timeout` + regra iptables `-m set`.
+3. **firewalld** — ipsets runtime via `firewall-cmd` (portável onde o
+   backend nft esconde o ipset legado).
+
+O banco (`ip_state`) é a fonte da verdade: sync no startup (bans sobrevivem
+a restart) e reconcile a cada 60 s converge unblocks manuais. Guarda
+never-ban (`[real_ip] trusted_ips`) recusa o IP antes de qualquer comando.
+**Linux-only** — em outro OS a action é pulada com warning; exige root ou
+`CAP_NET_ADMIN`.
+
+```toml
+[[action]]
+type = "challenge"
+provider = "firewall"
+[action.options]
+backend = "auto"            # auto | nftables | ipset | firewalld
+table = "sentry"            # tabela nftables
+set_prefix = "sentry_blocks"
+ttl_secs = 86400
+```
+
+## sentry-action-opnsense
+
+Bans em appliance de firewall (F6.1):
+[`OpnsenseProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-opnsense/src/lib.rs#L92)
+fala `provider = "opnsense"` (REST `alias_util` —
+`/api/firewall/alias_util/add|delete/<alias>`, alias provisionado no
+startup) ou `provider = "pfsense"` (`pfctl -t <table> -T add|delete`,
+executado sem shell). A plataforma só conhece drop: vereditos
+`Challenge`/`RateLimit` são logados como *unenforced* em vez de degradar
+silenciosamente para ban. TTL por mapa de expiração + reaper de 30 s (a
+plataforma não tem TTL por entrada); guarda never-ban antes de qualquer
+chamada.
+
+```toml
+[[action]]
+type = "challenge"
+provider = "opnsense"   # ou "pfsense"
+[action.options]
+base_url = "https://192.0.2.10"     # obrigatório para opnsense
+api_key_env = "SENTRY_OPN_API_KEY"
+api_secret_env = "SENTRY_OPN_API_SECRET"
+table = "sentry_blocks"
+# pfctl_path = "pfctl"
+# accept_invalid_certs = true
+```
+
+## sentry-action-nginx
+
+Gera includes de config para um nginx co-localizado (F7.8) e recarrega — a
+contraparte passiva do challenge JS nativo da edge
+([`NginxProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-nginx/src/lib.rs#L225)).
+Dois planos de enforcement a partir de um mesmo mapa em memória:
+
+- **Deny list** (`sentry-deny.conf`): linhas `deny <ip>;` para vereditos
+  `Block` (e `RateLimit` com `rate_limit_deny = true`), incluídas no
+  contexto `http`.
+- **Challenge** (`sentry-challenge.conf` + `sentry-challenge-if.conf`):
+  bloco `geo` que mapeia IPs de `Challenge` para `$sentry_challenge_ip`,
+  consumido por um include no `server {}` que ativa o módulo
+  `js_challenge` (getpagespeed). `provision_bots` (default true) também
+  gera o snippet de verificação de bots (`sentry-bots.conf`).
+
+Arquivos são reescritos atomicamente (tmp + rename) e carimbados com
+`# sentry:<created_unix>:<ttl_secs>` — o expiry sobrevive a restarts.
+Reload com debounce (≥ 1/s) e gates de `nginx -t` quando `validate = true`
+(reload quebrado é pulado, nunca aplicado). Denies reconciliam contra
+`ip_state` a cada 60 s; entradas de challenge são efêmeras por design.
+`ipv6_prefix` grava CIDRs (ex.: /64) em vez de IP exato.
+
+```toml
+[[action]]
+type = "challenge"
+provider = "nginx"
+[action.options]
+conf_dir = "/etc/nginx/conf.d/sentry"  # dentro do include path do nginx
+reload_cmd = "nginx -s reload"
+validate = true
+# rate_limit_deny = false
+# provision_bots = true
+# geo_var = "$sentry_challenge_ip"
+```
+
+## sentry-action-report
+
+Report comunitário (F7.4):
+[`ReportAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-report/src/lib.rs#L245)
+reporta IPs que ganharam veredito de enforce para bancos de abuso —
+`provider = "abuseipdb"` (default; `POST /api/v2/report`) ou
+`provider = "reportedip"`. Os SignalKind do Sentry mapeiam para as
+categorias de cada provider (um report de SQLi carrega a categoria SQLi,
+um port scan a categoria Port Scan, etc.).
+
+- **Dedupe** por IP com TTL default de 24 h (quotas diárias).
+- **Backoff** de 600 s após HTTP 429; **circuit breaker** desativa o
+  provider após 5 falhas consecutivas (até restart).
+- `min_verdict` (default `block`) filtra o que é reportado. IPs never-ban
+  nunca chegam a veredito de enforce, logo nunca são reportados.
+- A chave vem da env apontada por `key_env` (defaults
+  `SENTRY_ABUSEIPDB_KEY` / `SENTRY_REPORTEDIP_KEY`); sem chave, a action é
+  pulada com warning.
+
+```toml
+[[action]]
+type = "report"
+provider = "abuseipdb"
+[action.options]
+key_env = "SENTRY_ABUSEIPDB_KEY"
+# min_verdict = "block"
+# endpoint = "https://api.abuseipdb.com/api/v2/report"
+```
+
+## Ação `log` (built-in)
+
+Não existe crate `sentry-action-log` — o
+[`LogAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L4000)
+é built-in no binário: emite uma linha `tracing` por decisão não-`Allow`,
+roda inline e é registrada sempre que `type = "log"` aparece na config
+(ou quando nenhuma action é configurada).
+
+## Adicionar uma nova action (não-edge)
+
+1. Adicione uma variante ao
+   [`ActionKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2103).
+2. Crie a crate `sentry-action-<nome>` implementando `Action`.
+3. Adicione-a a `sentry-cli/Cargo.toml` e um braço no `match` de
+   `daemon::build_registry`.
+
+Para providers de **edge** o caminho é mais curto — nenhuma variante nova é
+necessária; veja
+[Challenge providers](/pt/plugins/challenge-providers).

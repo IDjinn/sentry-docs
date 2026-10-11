@@ -1,0 +1,158 @@
+---
+title: "API — sentry-edge"
+description: "Referência da API pública do sentry-edge: EdgeRuntime, middleware/reverse proxy, challenge PoW, páginas de erro, TLS, compressão e validação de protocolo"
+---
+
+# API — `sentry-edge`
+
+[`sentry-edge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L1) é a edge inline: três blocos de construção sobre o **mesmo** [`Pipeline`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L304) — o middleware axum ([`middleware`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/middleware.rs)), o reverse proxy [`serve`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/proxy.rs#L158) e o listener TCP ([`tcp_listener`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/tcp_listener.rs#L36)). O deployment default continua `passive`; inline exige `[deployment] mode = "inline"` e upstream saudável. A crate declara `#![forbid(unsafe_code)]`.
+
+## Runtime compartilhado
+
+### EdgeRuntime
+
+[`EdgeRuntime`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L104) segura pipeline + enriquecimento + limites de captura + modo, e é clonável (`Arc` por dentro). Construção por builders:
+
+```rust
+pub fn new(pipeline: Arc<Pipeline>, enrich: Option<Enricher>, body_cap: usize) -> Self;
+```
+
+| Builder | Efeito |
+| --- | --- |
+| [`with_block_table`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L380) | fast-path nega IPs da [`BlockTable`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/blocks.rs#L20) antes do pipeline |
+| [`with_trust`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L387) | [`SharedTrustSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/trust.rs#L191): never-ban passa, blacklist nega no fast-path, header-borne IP só vence de proxy confiável |
+| [`with_uploads`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L200) | inspeção de corpo ([`UploadsInspection`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L78): `inspect_bytes`, `max_files`, `oversize`) |
+| [`with_challenge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L412) / [`with_challenge_backend`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L434) | PoW local ou delegação Cloudflare |
+| [`with_bot_verifier`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L419) | crawlers verificados por rDNS bypassam o challenge |
+| [`with_error_pages`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L225) | páginas HTML customizadas ([`error_pages_handle`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L237) devolve o `Arc` para handlers sem o runtime em escopo) |
+| [`with_protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L358) | engine de validação de protocolo (F9) + métricas |
+| [`with_overload`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L167) | sob pressão, inspeção de corpo é pulada; detecção nunca |
+| [`with_posture`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L252) | advisories de headers de segurança (F11, weight 0) |
+
+Métodos de execução: [`process`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L545) (enrich → pipeline, mede `process_us`), [`inspect_body`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L292), [`challenge_gate`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L467) e [`is_hard_blocked`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L558) (block table + blacklist, com guard never-ban — você não se tranca fora).
+
+### inspect_body — reject / skip / flag
+
+```rust
+pub fn inspect_body(
+    &self,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> (Option<Vec<UploadInfo>>, Option<Vec<u8>>);
+```
+
+Corpos até `inspect_bytes` viram metadados de upload + prefixo de análise para os heurísticos. Acima do cap, a política `[uploads] oversize` decide: `reject` devolve `413` no caller; `skip` encaminha sem parse nem sinal; `flag` encaminha e anexa metadado sintético que alimenta a janela de flood e gera `UploadOversize`. Inspeção é ortogonal à persistência: `HttpData.body` volta ao cap de captura depois do `process`.
+
+### Resolução de IP real
+
+[`real_client_ip`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L590) segue a precedência fixa `CF-Connecting-IP` > `True-Client-IP` > `X-Real-IP` > primeiro hop do XFF > peer. Prefira [`real_client_ip_with`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L597): header só vence quando o peer é proxy confiável — cliente direto à origem não forja `CF-Connecting-IP`.
+
+## Middleware vs reverse proxy
+
+### Middleware axum
+
+[`middleware::handler`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/middleware.rs#L61) embute o Sentry num app Rust sem hop de proxy:
+
+```rust
+pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Next) -> Response;
+```
+
+Uso: `middleware::from_fn_with_state(runtime, sentry_edge::middleware::handler)`. O modo vem de [`MiddlewareMode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/middleware.rs#L36) ([`with_mode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/middleware.rs#L53) no runtime): `Inline` aplica o verdict antes do handler (Block→403, RateLimit→429, Challenge→challenge); `Shadow` só observa e anexa a decisão na extension [`DECISION`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/middleware.rs#L43).
+
+### Reverse proxy
+
+```rust
+pub async fn serve(
+    runtime: EdgeRuntime,
+    cfg: EdgeProxyConfig,
+    decided: mpsc::Sender<ProcessedEvent>,
+) -> Result<()>;
+```
+
+[`serve`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/proxy.rs#L158) exige health-check do upstream no startup. [`EdgeProxyConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/proxy.rs#L29) cobre listen (`""` desliga o plain — HTTPS-only), upstream, tuning do hop (connect timeout, pool de keepalive) e `forwarded_headers` (F12: a edge remove os `X-Forwarded-*` do cliente e seta a visão resolvida). Com [`TlsEdgeConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/proxy.rs#L59), 80 e 443 servem no mesmo router; `tls_redirect_https` responde 301 **depois** do pipeline, então a porta 80 continua monitorada.
+
+## JS challenge (PoW) — módulo `challenge`
+
+[`JsChallenge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/challenge.rs#L70) é um proof-of-work SHA-256 **stateless** e multi-node safe: `challenge_id = SHA-256(secret || ip || bucket)` — sem sessão no servidor, só o secret compartilhado (`SENTRY_EDGE_CHALLENGE_SECRET`, obrigatório quando habilitado).
+
+```rust
+pub fn new(secret: Vec<u8>, bucket_secs: u64, difficulty: u8, title: String, template_path: Option<PathBuf>) -> Self;
+pub fn challenge_id(&self, ip: IpAddr, bucket: u64) -> String;
+pub fn classify_cookie(&self, ip: IpAddr, value: &str, now: SystemTime) -> CookieCheck;
+pub fn page_response(&self, ip: IpAddr, headers: &HeaderMap, now: SystemTime) -> Response;
+```
+
+O browser precisa achar um nonce tal que `SHA-256(challenge_id || ":" || nonce)` tenha `difficulty` bits zero à esquerda ([`leading_zero_bits`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/challenge.rs#L215)) e recarregar com o cookie [`sentry_ch`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/challenge.rs#L39) (`"<bucket>:<nonce>"`). Dificuldade é clampeada em `8..=28`; o bucket rotaciona e o bucket anterior é aceito como graça de fronteira. [`CookieCheck`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/challenge.rs#L57) classifica Cloudflare-style: sem cookie/expirado → novo interstitial; cookie presente que **falha** a verificação → 403 terminal (quem tentou e falsificou não fica em loop). O gate completo vive em [`EdgeRuntime::challenge_gate`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L467), que devolve um [`ChallengeGate`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L91) (`Pass`/`Page`/`Blocked`/`Disabled`) — PoW nunca destrava um `Block`; crawlers verificados passam sem JS. O template (`template_path`) é re-lido a cada render e exige os placeholders `{{CHALLENGE}}`, `{{DIFFICULTY}}`, `{{BUCKET}}`, `{{MAX_AGE}}` e `{{SECURE}}`.
+
+## Páginas de erro — módulo `pages`
+
+Toda resposta gerada pela edge (403/429/challenge/413/502) é HTML com Trace ID. [`ErrorPages`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L97) carrega overrides de `[edge.error_pages] dir` **uma vez** no startup: `<status>.html` (ex. `403.html`) cobre aquele código, `default.html` cobre o resto; arquivo ruim ou >256 KiB é warn + skip, nunca derruba a edge.
+
+```rust
+pub fn from_dir(dir: &Path) -> Self;
+pub fn render_response(&self, status: StatusCode, title: &str, message: &str, trace: Option<Uuid>) -> Option<Response>;
+```
+
+Placeholders substituídos com HTML-escape: `{{SENTRY_STATUS}}`, `{{SENTRY_TITLE}}`, `{{SENTRY_MESSAGE}}`, `{{SENTRY_TRACE_ID}}` (vazio quando ausente) e `{{SENTRY_ICON}}` (logo embutido como data URI). O trace id vai também no header [`x-sentry-trace-id`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L24). Helpers que consultam o mapa antes do built-in: [`block_page`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L226), [`rate_limit_page`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L237), [`challenge_required_page`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L252), [`challenge_failed_page`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L264), [`delegated_challenge_page`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L279), [`payload_too_large_page`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L299) e [`bad_gateway_page`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/pages.rs#L311).
+
+## Telemetria TLS — módulos `clienthello` e `tls`
+
+### clienthello
+
+[`parse`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/clienthello.rs#L54) extrai telemetria dos bytes do ClientHello **antes** do handshake rustls (os bytes são realimentados via stream prefixada — o handshake vê os mesmos octetos):
+
+```rust
+pub fn parse(buf: &[u8]) -> Probe;
+pub struct ClientHello {
+    pub sni: Option<String>,
+    pub ja3: Option<String>,
+    pub ja4: Option<String>,
+    pub alpn: Option<String>,
+}
+```
+
+[`Probe`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/clienthello.rs#L26) retorna `Hello`/`NeedMore`/`Invalid` — hellos fragmentados em múltiplos records são reassemblados (cap de 64 KiB). JA3 é o md5 da string canônica em ordem de wire; JA4 segue o esquema FoxIO com sha256 truncado das listas **ordenadas** de ciphers/extensões.
+
+### tls (feature `edge-tls`)
+
+[`serve_tls`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/tls.rs#L37) aceita conexões TLS: block table nega antes de qualquer byte, o handshake tem budget de 5 s (slowloris cai), o evento `TlsHandshake` entra no mesmo pipeline (SNI ausente/desconhecido → `TlsSniMismatch`) e Block pós-handshake derruba a conexão. [`cert_not_after`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/tls.rs#L388) alimenta o gauge de expiração de certificado. Métricas em [`TlsMetrics`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L42): handshakes por versão, falhas, SNI mismatch e ALPN negociado.
+
+## Compressão — módulo `compression`
+
+Middleware de resposta ([`compress_layer`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/compression.rs#L338)) ligado por default via `[edge.compress]`; cobre upstream e páginas da edge nos dois listeners. Como os corpos já estão bufferizados, o re-encode é síncrono sobre `Vec<u8>` — `content-length` exato, sem streaming.
+
+```rust
+pub fn negotiate(accept: Option<&HeaderValue>) -> Option<Encoding>;
+pub struct Compressor { /* ... */ }
+impl Compressor {
+    pub async fn compress_response(&self, accept: Option<&HeaderValue>, resp: Response) -> Response;
+}
+```
+
+Negociação ([`negotiate`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/compression.rs#L94)): maior q-value de `Accept-Encoding` vence; empate prefere zstd > brotli > gzip (zstd atrás da feature `edge-zstd`). Nunca é comprimido: resposta já com `content-encoding`, 206/`content-range`, `no-transform`, corpo abaixo do mínimo, content-type fora da allowlist (nginx `gzip_types`; `text/event-stream` excluído) e payload que não encolhe. `Vary: Accept-Encoding` sempre em candidatos; sob overload do [`OverloadState`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/overload.rs#L26) desliga sozinho.
+
+## Edge TCP + validação de protocolo
+
+### tcp_listener
+
+```rust
+pub struct TcpEdgeConfig {
+    pub listen: String,
+    pub upstream: String,
+    pub connect_timeout_secs: u64,
+}
+pub async fn serve_tcp(runtime: EdgeRuntime, cfg: TcpEdgeConfig, decided: mpsc::Sender<ProcessedEvent>) -> Result<()>;
+```
+
+[`serve_tcp`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/tcp_listener.rs#L36) é a frente inline para serviços não-HTTP: verdict no connect (block fecha a conexão), depois byte pipe para o backend real.
+
+### protocol
+
+Quando um schema do [`sentry-protocol`](/pt/reference/api-protocol) guarda a porta local e declara framing, o pump valida o sentido client→server quadro a quadro. [`ProtocolConnection::bind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/protocol.rs#L53) liga o engine ao schema da porta (`None` = passthrough puro):
+
+```rust
+pub fn bind(engine: &ProtocolEngine, local_port: u16, metrics: Option<ProtocolMetrics>) -> Option<Self>;
+pub fn ingest(&mut self, chunk: &[u8]) -> Ingest;
+```
+
+[`Ingest`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/protocol.rs#L39) traz `forward` (frames que o upstream pode receber), `violations`, `disconnect` (setado em `enforce` — shadow encaminha e sinaliza) e `framing_broken`. Violações viram **um** evento por conexão com sinal `ProtocolViolation` no peso da policy citada (escalado `on_repeat` dobra), via [`signals`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/protocol.rs#L97). Métricas em [`ProtocolMetrics`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/protocol.rs#L19): `sentry_protocol_violations_total{schema, policy}` e `sentry_protocol_frames_total{schema}`.

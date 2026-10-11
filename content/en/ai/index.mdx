@@ -1,58 +1,179 @@
 ---
-title: "Detection Layers"
-description: "Heuristics → ONNX → LLM"
+title: "AI Layer"
+description: "Async forks: local ONNX model, optional LLM and external enrichment"
 ---
 
-# Detection Layers
+# AI Layer
 
-Sentry combines three detection layers in a cascade: deterministic heuristics
-(fast, zero known false positives), a local ONNX model (for the unknown), and
-an optional on-demand LLM (for complex payloads without a clear verdict).
+Sentry's hot path (rules → heuristics → routes → scan → score → policy →
+escalation) is **synchronous and fast** (µs per event). AI never sits on it:
+every AI stage runs as a **fork** beside the pipeline and feeds its result
+back through
+[`Pipeline::rescore_from`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L1005),
+which can only **raise** the score — never lower it. A clean event on the hot
+path stays clean, no matter what the AI says.
 
 <Mermaid chart={`
 flowchart TB
-    E[Evento] --> L0{Heurística rápida}
-    L0 -->|benigno claro| OK[Allow rápido]
-    L0 -->|malicioso claro| BLK[Block rápido]
-    L0 -->|incerto| L1[Embeddings + modelo ONNX]
-    L1 --> L2{Confiança > threshold?}
-    L2 -->|sim| DEC[Usar verdict IA]
-    L2 -->|não| L3[LLM opcional - prompt enxuto]
-    L3 --> DEC
+    E[Hot path result] --> AI{"AI fork - local ONNX - [ai]"}
+    E --> LLM{"LLM fork - [llm]"}
+    E --> EXT{"ip_lookup fork - [ip_lookup]"}
+    AI -->|signals| RS[rescore_from - raise only]
+    LLM -->|LlmMalicious signal| RS
+    EXT -->|ExternalReputation signal| RS
+    RS -->|verdict changed| ACT[Event update + action re-dispatch]
+    RS -->|verdict unchanged| END[Done]
 `} />
 
-## Layer 0 — Heuristics
+## The `rescore_from` contract
 
-Always runs, ~µs. Regex for SQLi/XSS/path traversal, ASN allowlist, local IP
-reputation. 9 detectors in `sentry-core/src/heuristics.rs`:
+Every AI stage re-enters the pipeline through the same door:
 
-- SQLi
-- XSS
-- PathTraversal
-- LFI
-- Log4Shell
-- CmdInjection
-- SensitivePath
-- BadCrawler
-- EmptyUserAgent
+- Extra signals are **added** to the existing score (saturating at 100) — no
+  fork ever subtracts risk.
+- The verdict is re-derived from the new level (Medium → RateLimit, High →
+  Challenge, Critical → Block).
+- **Never-ban** IPs (`[real_ip]` `trusted_ips`/`trusted_lists`) are never
+  elevated, no matter what a fork claims.
+- If the verdict does not change, the fork ends silently. If it changes, the
+  event is updated in Postgres and applicable actions are re-dispatched
+  (webhook, Cloudflare, blocklist, etc.).
 
-Heuristics run on the **URL-decoded** form of the path/query
-(`heuristics::http_text`), so that encoded payloads (`%27` = `'`, `+` or
-`%20` = space) cannot bypass them.
+## Modes: `fork` | `inline` | `shadow`
 
-## Layer 1 — Local ONNX model
+| Mode | Behavior |
+| --- | --- |
+| `fork` (default) | Async, non-blocking; concurrency bounded by a semaphore (`concurrency`). |
+| `inline` (`[ai]` only) | Awaited **before** persistence/actions; the hot path waits for the model. |
+| `shadow` | Evaluates, computes the re-score and only **logs** `would change verdict` — never updates the event, never dispatches actions. Zero enforcement effect; ideal for measuring accuracy before enabling for real. |
 
-Classifier trained on malicious payloads (SQLi, XSS, RCE, log4shell). Offline
-training, versioned model in `models/`. Local inference without depending on
-an external API.
+## Shared fork mechanics
 
-## Layer 2 — On-demand LLM (optional, high cost)
+The three forks ([`AiFork`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2131),
+[`LlmFork`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2315)
+and [`IpLookupFork`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2583))
+share the same backbone:
 
-Only for Medium events without a clear verdict; short prompt with truncated
-path+headers+payload. Structured response via JSON schema. Provider-agnostic
-via the `LlmProvider` trait.
+- **Trigger** — each fork decides whether to run by looking at the hot-path
+  result. Local AI: `trigger = "above_score"` (default, `min_score = 20`),
+  `"always"` or `"quarantine_only"`. LLM: score ≥ `only_above` (30) **or**
+  Quarantine verdict (cost control). External lookup: the gray band — score ≥
+  `trigger_above` (25) with a non-Block verdict, or the event carries any
+  signal listed in `on_signals`.
+- **Concurrency semaphore** — `[ai] concurrency = 4`, `[llm] concurrency =
+  4`; the external lookup uses a fixed semaphore of 2. Calls beyond the limit
+  queue up; hot-path throughput is never affected.
+- **Per-payload-hash cache** — the key hashes `client_ip + path + query +
+  user_agent` ([`payload_hash`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2109)),
+  with a TTL of `cache_ttl_secs` (300 s in `[ai]` and `[llm]`); the external
+  lookup caches per IP (`cache_ttl_secs`, 86400 s). Network/API errors are
+  not cached — the next call retries.
+- **Observability** — per-fork duration in
+  `sentry_fork_rescore_duration_seconds{fork="ai"|"llm"|"ip_lookup"}`.
 
-## Retraining
+## The four AI stages
 
-Offline pipeline consumes confirmed incidents → new model →
-`sentry model reload`.
+| Stage | Config | Trigger | Emitted signal | Weight |
+| --- | --- | --- | --- | --- |
+| Local ONNX model | `[ai]` | score ≥ `min_score` (20) | `AnomalousPayload` | `signal_weight` = 25 (override `[scorer.weights] anomalous_payload`) |
+| Remote LLM | `[llm]` | score ≥ `only_above` (30) or Quarantine | `LlmMalicious` | `risk_score × confidence` |
+| External lookup | `[ip_lookup]` | gray band or `on_signals` | `ExternalReputation` | scales with provider score (max 40) |
+| Verified bots | `[bot_verification]` | UA claims a crawler | `SpoofedBot` (only if fake) | 35 |
+
+The first two are covered in [Local ONNX Model](./onnx) and
+[LLM Provider](./llm). The other two follow.
+
+## External IP reputation lookup — `[ip_lookup]`
+
+Complements pull-based feeds: instead of importing a whole blocklist, a
+single client IP is queried at a provider when the pipeline lands in the
+**gray band** — elevated score but not yet acted on — or carries a configured
+suspicious signal. The answer feeds back through `rescore_from` (raise only).
+
+- Contract: the
+  [`IpLookupProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/lookup.rs#L30)
+  trait (`check(ip) -> IpLookupResult`); the
+  [`AbuseIpDbLookup`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/lookup.rs#L40)
+  implementation calls AbuseIPDB `GET /api/v2/check` (30-day window,
+  `abuseConfidenceScore` field).
+- The `ExternalReputation` signal scales with provider confidence:
+  25% ≈ +10 weight, 100% ≈ +40.
+- Runs **after** the AI/LLM forks — a post-LLM elevated score counts toward
+  the trigger band. IPs already blocked are not queried (the lookup can only
+  raise; spending quota would be pointless).
+- Guards: per-IP cache with TTL (default 86400 s) + the `max_per_hour`
+  quota (500/h default — comfortable headroom for the AbuseIPDB free tier,
+  1000/day).
+- API key via env, never in TOML: `key_env` (default
+  `SENTRY_ABUSEIPDB_KEY`).
+
+```toml
+[ip_lookup]
+enabled = true
+provider = "abuseipdb"
+key_env = "SENTRY_ABUSEIPDB_KEY"
+trigger_above = 25          # gray band: local score starts here
+on_signals = ["sensitive_path"]  # widen the trigger to signal carriers
+cache_ttl_secs = 86400
+max_per_hour = 500
+timeout_secs = 10
+```
+
+Keys and defaults in [`IpLookupConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L696);
+fork wiring in
+[`build_ip_lookup_fork`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2715).
+
+## rDNS-verified bots — `[bot_verification]`
+
+A User-Agent claiming to be a crawler is trivial to fake. Sentry validates
+the claim exactly the way the engines recommend ([`botverify.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs)):
+
+1. The UA contains a verifiable engine's pattern —
+   [`claimed_engine`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L96):
+   Googlebot, bingbot, Slurp, Baiduspider or YandexBot.
+2. The client IP's PTR record ends in one of the engine's domains
+   (`googlebot.com`, `search.msn.com`, …).
+3. The PTR hostname forward-resolves back to the original IP — defeats PTR
+   spoofing.
+
+The [`BotStatus`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L111)
+result is cached per IP: `Verified(engine)` (TTL `cache_ttl_secs`, 3600 s),
+`Spoofed` (short TTL `failed_ttl_secs`, 600 s — bots recover quickly from
+transient issues) or `Unknown`.
+
+- **Verified** → bypasses the edge JS challenge (search bots don't execute
+  JavaScript): the [`challenge_gate`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L467)
+  consults the verifier and lets the request through with the `bot_bypass`
+  counter ([`with_bot_verifier`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L419)).
+- **Spoofed** → the `SpoofedBot` signal with weight 35
+  ([`SPOOFED_BOT_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L326);
+  override via `[scorer.weights] spoofed_bot`).
+- **Unknown** → treated as unverified, never as spoofed: a DNS resolution
+  error is distinct from an empty PTR, so a DNS outage never flags a genuine
+  bot as fake.
+
+The core stays I/O-free: DNS is injected through the `BotDnsResolver` trait
+(the daemon wires hickory via [`HickoryDns`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/botdns.rs#L22)).
+A cache miss marks the event `Unknown` and queues the IP in the
+[`BotVerifier`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L206)
+— a background worker drains up to `batch_size` (16) verifications per
+cycle, off the hot path.
+
+```toml
+[bot_verification]
+enabled = true
+cache_ttl_secs = 3600       # verified-result TTL (per IP)
+failed_ttl_secs = 600       # spoofed-result TTL (short)
+timeout_ms = 2000           # one PTR+A verification round timeout
+batch_size = 16             # max queued claims verified per drain cycle
+```
+
+Keys and defaults in [`BotVerificationConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L580);
+daemon wiring in
+[`daemon.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L527).
+
+Inspect one IP without the daemon (uses the system resolver):
+
+```bash
+sentry bots check 66.249.66.1 --ua "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+```

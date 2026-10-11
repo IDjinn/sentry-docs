@@ -1,23 +1,4 @@
 {
   "title": "Sentry",
-  "pages": [
-    "overview",
-    "quickstart",
-    "---Architecture",
-    "architecture",
-    "---Rules Engine",
-    "rules",
-    "---Plugins",
-    "plugins",
-    "---AI",
-    "ai",
-    "---CLI",
-    "cli",
-    "---Configuration",
-    "config",
-    "---Sentry Auto",
-    "auto",
-    "---Deploy",
-    "deploy"
-  ]
+  "pages": ["overview", "quickstart", "---Architecture", "architecture", "---Rules Engine", "rules", "---Plugins", "plugins", "---AI", "ai", "---CLI", "cli", "---Configuration", "config", "---Reference", "reference", "---Examples", "examples", "---Deploy", "deploy"]
 }

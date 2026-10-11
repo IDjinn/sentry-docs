@@ -5,46 +5,64 @@ description: "What Sentry is, goals and non-goals"
 
 # Overview
 
-**Sentry** is a real-time access monitor for services exposed to the internet. It starts by monitoring **nginx** (via access logs) but is designed to scale to **any port/protocol** (HTTP, TCP, reverse proxies, packet capture, syslog). It uses AI + heuristics to detect malicious payloads, suspicious behavior, and invalid routes, and computes a **risk level** per request/IP. It integrates with **Cloudflare** for edge-layer challenge/block.
+**Sentry** is a real-time access monitor and **inline edge WAF** for services exposed to the internet. In passive mode it watches nginx access logs, syslog, the Cloudflare Logs API and TCP capture; in inline mode it **is** the reverse proxy in front of the application (HTTP on ports 80/443, with TLS, HTTP/2 and body inspection). It uses deterministic rules + heuristics + AI (local ONNX and optional LLM) to detect malicious payloads, suspicious behavior and invalid routes, computes a **risk level** per request/IP — and acts: block, challenge, rate-limit, kernel bans, webhooks.
 
 ## Goals
 
-- **Total modularity**: each data source (nginx, tcp, http-proxy) is a plugin behind a common trait.
+- **Total modularity**: every data origin (nginx, syslog, Cloudflare, TCP, inline edge) is a plugin behind a common trait ([`Source`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/source.rs#L26)); every way of acting is an [`Action`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/action.rs#L74).
 - **Real time**: event streaming, not batch.
 - **Precision**: combine deterministic rules (fast, zero known false positives) with AI (for the unknown).
-- **Action**: not only detect — block, challenge, rate-limit.
-- **Cross-platform**: a single Rust binary.
-- **Operable**: rich CLI for live tail, reports, export, blocklist management.
+- **Action**: not only detect — block, challenge, rate-limit, kernel bans (nftables/ipset/firewalld), community reporting (AbuseIPDB).
+- **Cross-platform**: a single Rust binary ([`sentry-cli`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli)), with an OS service mode (systemd/launchd/Windows Service).
+- **Operable**: rich CLI ([`cli.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cli.rs#L25)) for live tail, reports, SIEM export, blocklist management, plus an embedded web dashboard.
 
-## Non-goals (current phase)
+## Non-goals
 
-- Web dashboard (future phase, via Tauri or a separate HTTP backend).
-- Replace a commercial WAF — it's complementary.
-- Deep packet inspection of non-HTTP protocols in phase 1.
+- **Replacing a commercial WAF** — Sentry is complementary (Cloudflare is one of the edge providers, not a competitor).
+- **Header injection/rewriting** (e.g. auto-CSP breaks pages) — the posture module ([`posture.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/posture.rs)) is advisory-only; `mode = "enforce"` is rejected at load (roadmap `BACKLOG.md` §5.4).
+- **Kernel-bypass / eBPF, io_uring, AF_XDP, NUMA ring buffers** — these stay on the advanced-performance roadmap (`BACKLOG.md` §5.1).
 
 ## Why it exists
 
-Commercial WAFs cover the obvious. Sentry covers the **rest**: encoded payloads, sensitive path scanning, malicious crawlers, anomalous access patterns — combining fast rules (zero known false positives) with AI for the unknown. All in a single Rust binary, running locally, without sending your logs to third parties.
+Commercial WAFs cover the obvious. Sentry covers the **rest**: encoded payloads, sensitive path scanning, malicious crawlers, anomalous access patterns, polyglot uploads, TCP scanners with SYN fingerprints, bots faked via rDNS — combining fast rules (zero known false positives) with AI for the unknown. All in a single Rust binary, running locally, without sending your logs to third parties.
 
 ## Tech stack
 
-| Layer             | Technology                                          |
-|-------------------|-----------------------------------------------------|
-| Async runtime     | `tokio`                                             |
-| CLI               | `clap` (derive) + `ratatui` (TUI) + crossterm       |
-| Storage           | Postgres (`sqlx`, sqlx migrations)                  |
-| Config            | `figment` (TOML + env overlay, `SENTRY_` prefix)   |
-| HTTP client       | `reqwest` (native-tls on Windows / rustls in containers) |
-| AI                | `ort` (ONNX, local) + `LlmProvider` trait           |
-| Edge actions      | `ChallengeProvider` trait (Cloudflare, …)           |
-| Geo/ASN           | `maxminddb` (local GeoLite2)                        |
-| Errors            | `thiserror` (lib) + `color-eyre` (bin)              |
-| Tests             | `proptest` + `insta` (snapshots) + `wiremock`       |
+| Layer | Technology |
+|---|---|
+| Async runtime | [`tokio`](https://github.com/IDjinn/sentry/blob/main/Cargo.toml) |
+| Inline edge | [`axum`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge) + `hyper` (reverse proxy, HTTP/2 via ALPN) |
+| TLS | [`tokio-rustls`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/tls.rs) (`edge-tls` feature; ring provider) |
+| CLI | `clap` (derive) + [`ratatui`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/tui) (TUI) + crossterm |
+| Storage | Postgres (`sqlx`, migrations in [`crates/sentry-storage/migrations/`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/migrations)) |
+| Config | `figment` (TOML + env overlay, `SENTRY_` prefix; [`config.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L14)) |
+| HTTP client | `reqwest` (native-tls on Windows / rustls in containers) |
+| AI | `ort` (local ONNX, optional feature; [`sentry-ai`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai)) + [`LlmProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L95) trait (OpenRouter/Ollama/OpenAI-compatible/Jev) |
+| Edge actions | [`ChallengeProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L95) trait (Cloudflare, firewall, OPNsense/pfSense, nginx) |
+| Hot-reload | `arc-swap` (prefilter/rules/protocols) + `notify` (schema watcher) |
+| Text/SIMD | `aho-corasick` (prefilter), `memchr` + `simdutf8` (`simd` feature of [`sentry-protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol)) |
+| Auth | `argon2` (dashboard login; [`auth.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/auth.rs)) |
+| Geo/ASN | `maxminddb` (local GeoLite2; [`sentry-geo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-geo)) |
+| DNS | `hickory-resolver` (bot rDNS verification) |
+| Compression | `brotli` / `flate2` / `zstd` (`edge-zstd` feature) |
+| Errors | `thiserror` (lib) + `color-eyre` (bin) |
+| Tests | `proptest` + `insta` (snapshots) + `wiremock` |
 
 ## Status
 
+All planned phases are **concluded** (detailed checklist in the repository [`AGENTS.md`](https://github.com/IDjinn/sentry/blob/main/AGENTS.md)):
+
 - **F0** (done): foundation — workspace, core, traits, config, CLI skeleton.
-- **F1** (done): nginx MVP — source, heuristics, scorer, pipeline, TUI.
-- **F2**: Cloudflare + local AI (ONNX).
-- **F3**: Multi-source (TCP, syslog) + LLM (OpenRouter).
-- **F4**: Web dashboard.
+- **F1** (done): nginx MVP — source with tail+rotation, URL-decoding heuristics, rules engine with DSL, scorer, pipeline, TUI, Postgres storage, geo enrichment.
+- **F2** (done): Cloudflare hardening + local ONNX AI (async fork), rate limiting, parameterized/learned/imported routes (OpenAPI/Postman/HAR), Prometheus metrics + Grafana, repeat-offender escalation, scan detectors, IPv6 /64 blocking.
+- **F3** (done): multi-source (syslog RFC 5424/3164, Cloudflare Logs, TCP with SYN fingerprinting), LLM (OpenRouter/Ollama), behavioral detection (brute force, credential stuffing), reputation feeds, cross-IP scan→attack correlation and the **inline edge** ([`sentry-edge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge)) with a BlockTable.
+- **F4** (done): operations — web dashboard (`sentry serve` + embedded SPA), Argon2id auth + RBAC, bidirectional alerts (incidents + ack/resolve), SIEM export (CEF/LEEF/syslog), OS service mode, multi-node HA.
+- **F5** (done): performance — Aho-Corasick prefilter, caches, batched ingest; pipeline from 3.49 ms to 4.36 µs/event (~800×); two lanes (inline/deferred) and overload response with tiered degradation.
+- **F7** (done): honeypot hardening — `[real_ip]` with trusted proxies, kernel bans (nftables/ipset/firewalld), community reporting (AbuseIPDB/ReportedIP), datasets (TOML and DB-backed), rDNS bot verification, proof-of-work JS challenge, nginx and OPNsense/pfSense providers.
+- **F8** (done): inline TLS 443 — TLS termination, ClientHello telemetry (**JA3/JA4**), `TlsSniMismatch` signal, cert expiry gauge.
+- **F9** (done): protocol schemas — YAML DSL ([`sentry-protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol)) to validate frames on non-HTTP ports with a compiler + VM in safe Rust, optional SIMD and live hot-reload.
+- **F10** (done): upload and request-body inspection (inline edge) — multipart/urlencoded/JSON, polyglot images, disguised executables, upload floods.
+- **F11** (done): web security posture — header advisories (CSP, HSTS, COOP, clickjacking, Trusted Types, nosniff, referrer policy), advisory-only.
+- **F12** (done): customizable HTML error pages with Trace IDs, upload policies (oversize/allowlist) and edge performance (zstd/brotli/gzip compression, HTTP/2, forwarded headers, upstream hop tuning).
+
+Phase **F6** (firewall/platform integrations) was delivered in parts alongside F7/F8 — OPNsense/pfSense providers (F6.1), nginx provider with challenge (F6.2) — and the remainder (HAProxy maps, Suricata/fast.log export) stays on the `BACKLOG.md` §5.2 roadmap.

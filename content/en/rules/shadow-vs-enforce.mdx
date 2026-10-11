@@ -1,66 +1,137 @@
 ---
 title: "Shadow vs Enforce"
-description: "Pack execution modes and when to use each"
+description: "Mode semantics per pack, uploads/posture modes, verdict policy and safe rollout"
 ---
 
 # Shadow vs Enforce
 
-Each default pack runs in one of three modes, controlled by
-`mode = "shadow" | "enforce" | "off"` per pack in `sentry.toml`.
+"Shadow" and "enforce" appear in several places across Sentry with the same
+philosophy: **detect first, act later**. This page covers the modes of the
+[packs](/en/rules/packs), the uploads shadow mode, the posture invariant,
+the verdict policy (`[[policy.override]]`) and repeat-offender escalation.
 
-## Modes
+## Pack modes
 
-| Mode      | Behavior                                                              |
-|-----------|-----------------------------------------------------------------------|
-| `shadow`  | Only `Log` — records what *would* match, but takes no action. No traffic impact. |
-| `enforce` | Executes the action (`Block`, `Challenge`, `RateLimit`). Actually blocks/challenges. |
-| `off`     | Pack disabled — rules are not loaded.                                 |
+Controlled by `mode = "shadow" | "enforce" | "off"` on each
+`[[rules.pack]]`
+([`PackMode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L10)):
 
-## When to use each
+| Mode      | Behavior                                                                        |
+|-----------|----------------------------------------------------------------------------------|
+| `shadow`  | The pack's rules become `Log`: matches are recorded (a weight-0 `RuleHit` signal) but nothing blocks. |
+| `enforce` | The rules become the pack's real action (`Block`, `Challenge`, `RateLimit` — see the [packs](/en/rules/packs) table). |
+| `off`     | Pack disabled — its rules never join the ruleset. Unknown mode strings also become `off`. |
 
-### `shadow` (default for most packs)
+Modes are read **at startup** (packs are compiled in
+[`build_default_ruleset_with`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/packs.rs#L61)).
+Changing a mode requires a daemon restart — hot-reload via
+`sentry_rules_changed` only reloads Postgres rules. Exception:
+`crawlers_good` produces `Allow` in any active mode; the mode only turns
+the pack on.
 
-- **First deploy** — observe what the pack would detect before hardening.
-- **New traffic** — new app, new CDN, new source country.
-- **False-positive validation** — confirm zero FP before promoting.
+## Shadow beyond packs
 
-### `enforce`
+- **`[uploads] mode = "shadow"`** (the F10 default, alongside
+  `enabled = false`) — upload-origin signals
+  (`UploadPolyglot`, `UploadExecutable`, `UploadTypeMismatch`,
+  `UploadDisallowed`, `UploadOversize`, `UploadFlood`) are emitted with
+  **weight 0**: detected, logged and metricized without ever raising the
+  verdict
+  ([`UploadMode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L917)).
+  `mode = "enforce"` restores full weights and containment happens before
+  the upstream sees the request.
+- **Posture (F11) has no enforce mode** — the `PostureAdvisory` signal has
+  its weight locked at 0 in both pipeline weight functions
+  ([`POSTURE_ADVISORY_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L222)),
+  and not even a `[scorer.weights]` override can change that. Findings
+  describe the protected site, never the visitor — advisories are shadow
+  by construction.
+- **`[real_ip] shadow`** — IPs on the shadow list are **fully analyzed**
+  but never banned: the pipeline's
+  [`cap_shadow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L782)
+  forces `Allow` with reason `shadow ip (no ban)`, including on rule
+  short-circuits.
 
-- **`sensitive_paths`** — ships in enforce from the start: access to
-  `.env`/`.git`/`.ssh` is statistically 100% malicious.
-- After a shadow period with zero false positives, promote the pack with:
+## Verdict policy (`[[policy.override]]`)
 
-  ```bash
-  sentry rules packs enable vpn_proxy --mode enforce
-  ```
+Detection says *what was found*; policy says *what to do about it*.
+[`VerdictPolicy`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/policy.rs#L17)
+maps each risk level to a verdict:
 
-### `off`
+| Level      | Default verdict |
+|------------|------------------|
+| `info`     | `allow`          |
+| `low`      | `allow`          |
+| `medium`   | `rate_limit`     |
+| `high`     | `challenge`      |
+| `critical` | `block`          |
 
-- A pack that doesn't apply to your context (e.g. `country_blocklist` when
-  you serve globally).
+Every level can be remapped, and ordered `[[policy.override]]` entries
+(DSL expression + verdict) force a verdict for specific traffic — **the
+first match wins** and the rest are skipped. Valid verdicts: `allow`,
+`rate_limit`, `challenge`, `block`, `quarantine`. A fired override shows up
+as the decision's `override_reason` on the event.
 
-## Recommended rollout policy
+```toml
+[policy]
+medium = "rate_limit"
 
-1. **Start everything in `shadow`** and observe the logs (or `sentry tail`).
-2. Check for false positives over a few days.
-3. Promote one pack at a time to `enforce`, starting with the most obvious
-   ones (`sensitive_paths`, `crawlers_bad`).
-4. Keep `crawlers_good` in `enforce` (allow) from the start if you care
-   about SEO.
-5. Use `sentry rules test <ip>` to simulate before promoting.
+[[policy.override]]
+match = 'path=/admin/*'
+verdict = "block"
 
-## Exception: `sensitive_paths`
+[[policy.override]]
+match = 'reputation = "authorized"'
+verdict = "allow"
+```
 
-`sensitive_paths` ships in `enforce` by default. Access to `.git/`, `.env`,
-`.ssh/` is statistically 100% malicious in web apps (there is no legitimate
-reason for a browser to access these). The cost of a false positive here is
-zero versus the risk of leaking credentials.
+Invalid expressions here **fail config loading** (unlike
+`[[rules.custom]]`, where only the offending rule is dropped).
+
+## Repeat-offender escalation
+
+After the decision (rule or scorer), escalation
+([`OffenderTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/offender.rs#L36))
+kicks in: every event with a verdict other than `Allow` records one strike
+per IP, and strikes crossing the thresholds **only ever raise** the verdict
+(`RateLimit` → `Challenge` → `Block`; a `Block` is never lowered, and
+`Allow` records no strike and is never escalated —
+[`escalate_at`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/offender.rs#L142)).
+
+```toml
+[escalation]
+enabled = true
+window_secs = 604800   # 7 days — outlives the 24h TTL of edge rules
+challenge_at = 3
+block_at = 5
+persist = true         # mirrors strikes to ip_state (Postgres), pre-warms at startup
+```
+
+Because strikes persist, a returning offender that comes back after the
+edge TTL expires is re-blocked **on its first violating event**.
+Escalation also runs over rule short-circuits.
+
+## Safe rollout
+
+1. **Start everything in `shadow`** — packs, datasets (`action = "log"`)
+   and uploads (`mode = "shadow"`).
+2. **Observe**: daemon logs, the dashboard (`/api/events`), metrics
+   (`sentry_signal_kinds_total{kind}` per signal kind) and each match event
+   carrying the rule id.
+3. **Simulate** before promoting: `sentry rules test --path /admin --ip
+   1.2.3.4 --ua "sqlmap/1.0"`.
+4. **Promote one pack at a time** by editing `mode` in `sentry.toml` and
+   restarting the daemon. `sentry rules packs` lists the state, but mode
+   changes go through config (there is no `rules packs enable --mode`).
+5. `sensitive_paths` ships in `enforce` — it's the only one. Harden the
+   rest after a few days with zero false positives.
+6. For feeds/datasets, flip `action = "log"` to `"block"`/`"challenge"` —
+   the synthetic rules (`feed:<name>`/`dataset:<name>`) hot-reload.
 
 ## CLI
 
 ```bash
-sentry rules packs list                          # shows packs and state
-sentry rules packs enable vpn_proxy --mode enforce
-sentry rules packs enable tor --mode shadow
-sentry rules packs disable crawlers_good
+sentry rules packs                                  # pack state
+sentry rules test --path /admin --method GET --ip 1.2.3.4 --ua "sqlmap/1.0"
+sentry rules list                                   # active rules (DB + config)
 ```

@@ -1,0 +1,57 @@
+---
+title: "Referência"
+description: "Mapa das crates do Sentry e convenções da referência de API"
+---
+
+# Referência
+
+Esta seção é a **referência de API** das crates públicas do Sentry. Ela documenta a superfície que um autor de plugin (traits `Source`/`Action`/providers) ou um operador (types de config, repos de storage, runtime da edge) toca — não cada função privada.
+
+## Convenções
+
+- Cada item documentado (struct, enum, trait, fn, módulo) leva um **link para o fonte** no GitHub, com âncora de linha — ex.: [`Event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L198). O código é a verdade; aqui vão assinaturas e semântica.
+- Blocos de código mostram **apenas a assinatura** (com o doc-comment `///` quando ele resume o contrato), nunca o corpo.
+- A organização é **crate → módulo → item**: `##` para módulos, `###` para itens. Listas de campos/variantes/métodos usam tabelas quando ficam mais legíveis que prosa.
+- Pesos de sinal e thresholds documentados são os **defaults compilados**; quase todos podem ser sobrescritos por config (`[scorer.weights]`, janelas de trackers etc.). Quando houver override, o valor da config vence.
+
+## Páginas
+
+| Página | Conteúdo |
+| --- | --- |
+| [API do sentry-core](/pt/reference/api-core) | Modelo de domínio (`Event`, `ProtocolData`), sinais e vereditos, traits de plugin, rules engine, policy, pipeline, trackers, config |
+| [API do sentry-edge](/pt/reference/api-edge) | `EdgeRuntime`, middleware/reverse proxy, challenge PoW, páginas de erro, telemetria TLS, compressão, validação de protocolo |
+| [API do sentry-protocol](/pt/reference/api-protocol) | DSL de schemas de protocolo, compilador, VM, guards de DoS, feature `simd` |
+| [API do sentry-storage](/pt/reference/api-storage) | Repositórios Postgres, migrations, dedupe por `payload_hash`, canais LISTEN/NOTIFY |
+
+## Mapa de crates
+
+O workspace tem 19 crates. Toda crate de plugin depende apenas de `sentry-core` (contratos), nunca de outra plugin; deps pesadas ficam atrás de features opcionais.
+
+| Crate | Papel |
+| --- | --- |
+| [`sentry-core`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/lib.rs#L1) | Modelo de domínio (`Event`, `Signal`, `Verdict`), traits `Source`/`Action`/`ChallengeProvider`, rules engine + DSL, heurísticas, trackers, schema de config. Pura: sem I/O. |
+| [`sentry-storage`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/lib.rs#L1) | Persistência Postgres (sqlx): pool, migrations e repos tipados (events, incidents, ip_state, rules, routes, datasets). |
+| [`sentry-ai`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/lib.rs#L1) | Trait `ThreatModel` (ONNX via `ort`, feature opcional), trait `LlmProvider` (OpenRouter/Ollama) e `IpLookupProvider` (AbuseIPDB). |
+| [`sentry-edge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/src/lib.rs#L1) | Edge inline: middleware axum, reverse proxy, listener TCP, frente TLS (feature `edge-tls`), challenge PoW, páginas de erro, compressão. |
+| [`sentry-protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/lib.rs#L1) | DSL YAML que descreve/valida protocolos não-HTTP em portas não padrão; compilador + VM de registradores. Pura, sem dep de sentry-core. |
+| [`sentry-geo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-geo/src/lib.rs#L1) | Enriquecimento geo/ASN com MaxMindDB local (no-op gracioso sem MMDB). |
+| [`sentry-reputation`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-reputation/src/lib.rs#L1) | Feeds de reputação (Tor/Spamhaus/FireHOL) com fetcher guardado contra SSRF e store de prefixos IP. |
+| [`sentry-source-nginx`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-nginx/src/lib.rs#L1) | Plugin `Source`: tail de access.log do nginx com resolução de IP real e rotação. |
+| [`sentry-source-syslog`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-syslog/src/lib.rs#L1) | Plugin `Source`: receptor syslog RFC 5424/3164 (UDP/TCP, framing RFC 6587). |
+| [`sentry-source-cloudflare`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-cloudflare/src/lib.rs#L1) | Plugin `Source`: polling da Cloudflare Logs API (NDJSON, dedupe por RayID). |
+| [`sentry-source-tcp`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-tcp/src/lib.rs#L1) | Plugin `Source`: captura TCP (feature `pcap`) + fingerprint SYN estilo MuonFP/p0f. |
+| [`sentry-action-cloudflare`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-cloudflare/src/lib.rs#L1) | `ChallengeProvider`: block/challenge/rate-limit via API da Cloudflare (access rules + IP Lists). |
+| [`sentry-action-webhook`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-webhook/src/lib.rs#L1) | `Action`: alertas Discord/Slack/etc. assinados com HMAC (`X-Sentry-Signature`). |
+| [`sentry-action-blocklist`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-blocklist/src/lib.rs#L1) | `Action`: blocklist local em memória (espelha vereditos Block na `BlockTable`). |
+| [`sentry-action-firewall`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-firewall/src/lib.rs#L1) | `ChallengeProvider`: bans de kernel nftables/ipset/firewalld (Linux; DB é fonte da verdade). |
+| [`sentry-action-opnsense`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-opnsense/src/lib.rs#L1) | `ChallengeProvider`: bans OPNsense (alias_util REST) e pfSense (`pfctl`). |
+| [`sentry-action-nginx`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-nginx/src/lib.rs#L1) | `ChallengeProvider`: includes deny/challenge para nginx com reload validado (`nginx -t`). |
+| [`sentry-action-report`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-report/src/lib.rs#L1) | `Action`: report comunitário de abusos (AbuseIPDB/ReportedIP) com dedupe e circuit breaker. |
+| [`sentry-cli`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/lib.rs#L1) | O binário `sentry`: clap + daemon + server HTTP + TUI ratatui + auth + export SIEM + service mode. |
+
+## Estabilidade
+
+- **MSRV 1.80** (Rust 2021), fixado no [`Cargo.toml`](https://github.com/IDjinn/sentry/blob/main/Cargo.toml) do workspace — o piso existe por causa de `std::sync::LazyLock`.
+- **Sem `unsafe`**: todas as lib crates declaram `#![forbid(unsafe_code)]` (ex.: [`sentry-core`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/lib.rs#L11), [`sentry-protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/src/lib.rs#L48)).
+- A regra de ouro do modelo de dados: o `Event` é modular via [`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396) — nenhum consumidor assume que um evento é HTTP. Novos protocolos entram como variantes do enum, nunca como campos soltos.
+- Features pesadas ficam **opcionais e desligadas por default**: `onnx` (inferência local), `edge-tls` (frente HTTPS), `edge-zstd`, `pcap`, `rate-redis`, `service`. A superfície documentada aqui existe independente delas, salvo indicação.

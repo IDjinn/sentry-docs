@@ -1,72 +1,134 @@
 ---
 title: "LLM Provider"
-description: "Layer 2 — LLM provider-agnostic via the LlmProvider trait"
+description: "Optional remote classification, provider-agnostic via the LlmProvider trait"
 ---
 
 # LLM Provider
 
-Sentry's Layer 2 uses an LLM **on demand** for Medium events without a clear
-verdict from previous layers. Sentry is **provider-agnostic**: it never calls
-an LLM API directly, always through a trait. This lets you swap model/provider
-without changing code — only config. The **OpenRouter** adapter is recommended
-as default because a single endpoint routes to any model (Claude, GPT, Gemini,
-Qwen, Llama, DeepSeek…), useful to experiment with cost vs. quality.
+The LLM is the **optional**, highest-cost layer: it runs as a
+[fork](./index#modes-fork--inline--shadow) for events the hot path and the
+[local model](./onnx) could not settle — score ≥ `only_above` (30) or a
+Quarantine verdict. The core never calls an LLM API directly: everything
+goes through the [`LlmProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L95)
+trait, and selection happens by config. The default is off
+(`[llm] provider = "none"`).
 
-## `LlmProvider` trait
+## The `LlmProvider` trait
 
 ```rust
-// sentry-ai/src/llm.rs
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    fn name(&self) -> &'static str;            // "openrouter" | "ollama" | "openai" | "anthropic"...
-    fn model_id(&self) -> &str;                // ex: "anthropic/claude-3.5-sonnet"
+    fn name(&self) -> &'static str;   // "openrouter", "ollama", …
+    fn model_id(&self) -> &str;       // e.g. "anthropic/claude-3.5-sonnet"
     async fn classify(&self, req: ClassifyRequest) -> anyhow::Result<ClassifyResponse>;
     async fn explain(&self, req: ExplainRequest) -> anyhow::Result<String>;
 }
-
-pub struct ClassifyRequest {
-    pub protocol: ProtocolData,    // works for Http, Tcp, etc.
-    pub context: String,           // truncated summary: path, key headers, payload preview
-    pub schema: JsonSchema,        // mandatory structured response
-}
-pub struct ClassifyResponse {
-    pub verdict: Verdict,
-    pub risk_score: u8,
-    pub signals: Vec<String>,
-    pub confidence: f32,           // 0.0–1.0
-}
 ```
+
+Defined in
+[`sentry-ai/src/llm.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L95-L107).
+The contracts around it:
+
+- [`ClassifyRequest`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L32) —
+  the payload (`ProtocolData`, works for Http/Tcp/Tls/…), a truncated
+  human-readable summary and the mandatory JSON schema for the response.
+- [`ClassifyResponse`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L56) —
+  `verdict`, `risk_score` (0–100), `risk_level`, `signals`, `confidence`
+  (0.0–1.0), optional `explanation` and `usage`
+  ([`LlmUsage`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L44):
+  input/output tokens + cost, when the provider reports it).
+- [`ExplainRequest`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L80) —
+  free-form explanation of an already-classified event (CLI and webhooks).
+
+## Shared prompt and parsing
+
+Every adapter sends the same system prompt and JSON schema
+([`llm/prompt.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/prompt.rs)):
+
+- [`SYSTEM_PROMPT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/prompt.rs#L17) —
+  frames the model as a WAF triage analyst and tells it to be conservative:
+  ordinary traffic → `allow` with a low score; known attack patterns →
+  `block`/`challenge` with a high score.
+- [`classify_schema`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/prompt.rs#L31) —
+  strict schema: closed verdict enum, `risk_score` 0–100, `signals`,
+  `confidence`; extra fields forbidden (`additionalProperties: false`).
+- [`context_from_event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/prompt.rs#L54) —
+  the event summary for the user message (method, path, query, status, UA,
+  referer, body preview; SNI/JA3/JA4 for TLS), truncated to 2048 characters
+  for predictable token cost.
+- [`parse_classify`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/prompt.rs#L127) —
+  tolerant parsing: extracts the JSON object even when surrounded by prose
+  or markdown fences, normalizes tokens (`"Rate-Limit"` = `rate_limit`,
+  `"deny"` = `block`), clamps out-of-range score/confidence and re-derives
+  `risk_level` from the score.
 
 ## Adapters
 
-Each adapter in its own module/feature:
+Constructed from config in
+[`make_llm_provider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2466)
+(also used by `sentry bench llm`). An unknown name or a missing key = warning
++ stage disabled for the run — never a crash.
 
-| Provider             | Endpoint                                          | Auth                            |
-|----------------------|---------------------------------------------------|---------------------------------|
-| `OpenRouterProvider` | `POST https://openrouter.ai/api/v1/chat/completions` | `Authorization: Bearer $SENTRY_LLM_KEY` |
-| `OllamaProvider`     | `http://localhost:11434/api/chat` (local, no key) | —                               |
-| `OpenAiProvider`     | `api.openai.com` (via `async-openai`)             | `OPENAI_API_KEY`                |
-| `AnthropicProvider`  | `api.anthropic.com` (messages API)               | `ANTHROPIC_API_KEY`             |
-| `MockProvider`       | For deterministic tests                            | —                               |
+| Provider (`[llm] provider`) | Implementation | Endpoint | Auth | Notes |
+| --- | --- | --- | --- | --- |
+| `openrouter` (recommended) | [`OpenRouterProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/openrouter.rs) | `https://openrouter.ai/api/v1/chat/completions` | `SENTRY_LLM_KEY` (bearer) — no key disables the stage | One endpoint routes to any model (Claude, GPT, Gemini, Qwen, Llama, …). Sends `response_format: json_schema` with `strict: true`. 60 s timeout. Default model: `openai/gpt-4o-mini`. |
+| `ollama` | [`OllamaProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/ollama.rs) | `http://localhost:11434/api/chat` | — (local, keyless) | Zero cost, zero data leaves the host. Schema goes into the system prompt + `format: "json"` (`response_format` support varies across Ollama versions). 120 s timeout. Default model: `llama3.1`. |
+| `openai` | reuses `OpenRouterProvider` | any OpenAI-compatible server (`base_url`; default `http://localhost:1234/v1`) | `SENTRY_LLM_KEY` sent as bearer when set | LM Studio, vLLM, llama.cpp server — runs keyless against a local server. |
+| `jev` | [`JevProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/jev.rs) | `https://api.typesafe.ai` | `SENTRY_JEV_KEY` (or `TYPESAFE_API_KEY` / `JEV_API_KEY` / `~/.config/typesafe/key`) | Calibrated, non-generative classifier: one call answers the verdict (choice) + a 0–9 risk score with calibrated probabilities — no JSON repair, no hallucinated fields. `explain` returns a breakdown, not prose. Default model: `jev-latest`. |
+| `mock` | [`MockLlmProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/mock.rs#L13) | — | — | Deterministic, for tests and wiring (default: `block`, score 90, confidence 0.9). |
 
-The OpenRouter adapter sends `body: { model, messages, response_format:
-json_schema }` and the response is validated against the mandatory JSON
-schema.
+There is no dedicated Anthropic/OpenAI-SDK adapter: use `openrouter` (which
+routes to those models) or `openai` with `base_url` pointing at a compatible
+endpoint.
 
-## Config-driven selection
+## The daemon fork (`LlmFork`)
+
+[`LlmFork`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2315)
+mirrors the local AI fork:
+
+- **Trigger**: score ≥ `only_above` (default 30) **or** a Quarantine verdict.
+- **Semaphore** `[llm] concurrency` (default 4) + **TTL cache keyed by
+  payload hash** (`cache_ttl_secs`, default 300 s) — identical payloads do
+  not re-call the LLM within the window.
+- **Signal mapping**
+  ([`llm_signals`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2442)):
+  a benign answer (verdict `allow` with score < 20) produces no signal at
+  all — the fork can only raise risk, so a zero-weight signal would be
+  noise. A malicious answer → the `LlmMalicious` signal with **weight =
+  risk_score × confidence** and detail = `explanation` (or the signal list).
+- **Re-entry** through `rescore_from` (raise only); in `mode = "fork"` the
+  event is updated in Postgres and applicable actions re-dispatched; in
+  `mode = "shadow"` the outcome is only logged (`would change verdict`) —
+  nothing acts.
+
+## `[llm]` configuration — minimal example
 
 ```toml
-[analysis.ai]
-llm_provider = "openrouter"        # none | openai | ollama | openrouter | anthropic
-llm_model = "anthropic/claude-3.5-sonnet"
-llm_only_above = 30                 # only triggers LLM if risk_score > 30
+[llm]
+provider = "openrouter"
+model = "anthropic/claude-3.5-sonnet"
+mode = "fork"                # or "shadow" to observe without acting
+only_above = 30              # escalate from this score (or on Quarantine)
+concurrency = 4
+cache_ttl_secs = 300
 ```
 
-Switching to Ollama = change 2 lines. A verdict cache keyed by payload hash
-avoids calling the LLM again for identical payloads within a short window.
+```bash
+export SENTRY_LLM_KEY="sk-or-v1-…"
+```
 
-## Open decisions (to validate)
+Keys and defaults in [`LlmConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1844);
+the default provider is `none` (off). To run fully local, switch to
+`provider = "ollama"` with `model = "llama3.1"` — no key, no code change.
 
-- **Default LLM**: **Ollama local** recommended (no cost, no data leak).
-  OpenAI is opt-in.
-- The LLM should only be triggered on **< 2% of events** (controlled cost).
+## Benchmarking providers
+
+```bash
+sentry bench llm --providers mock,ollama,openrouter --n 200
+```
+
+The [`sentry bench llm`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/bench_llm.rs)
+harness compares providers on latency, agreement with the heuristic
+pipeline, output quality and cost — using the built-in labeled synthetic kit
+or replaying an access.log (`--events`) — before you commit money to a
+provider.

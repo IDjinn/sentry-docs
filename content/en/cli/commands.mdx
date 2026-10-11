@@ -1,108 +1,473 @@
 ---
 title: "Command Reference"
-description: "sentry CLI subcommands"
+description: "Every sentry CLI subcommand: flags, defaults, examples and environment variables"
 ---
 
 # Command Reference
 
-The CLI uses `clap` (derive) with subcommands. Real handlers in `cmd.rs`.
+The CLI is defined with `clap` (derive) in
+[`cli.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cli.rs)
+and dispatched to the handlers in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+Everything below was verified against those definitions.
+
+Conventions: placeholders in backticks (`<ip>`, `<path>`); durations accept
+`24h`, `7d`, `30m`. Almost every subcommand loads the config file (and many
+require Postgres in `storage.postgres.url`).
+
+## Global flags
+
+| Flag | Description |
+| --- | --- |
+| `--config <path>` | Config file path. Default: `sentry.toml` in cwd or `/etc/sentry/sentry.toml`. Also via the `SENTRY_CONFIG` env var. |
+| `-v` / `-vv` / `-vvv` | Log verbosity: `info`, `debug`, `trace`. |
 
 ## Monitor / daemon
 
+### `sentry run`
+
+Starts the daemon in the foreground: sources → pipeline (rules → heuristics →
+AI/LLM) → actions, hot-reload via LISTEN/NOTIFY, prune tasks and the
+Prometheus metrics server. Handler in
+[`daemon.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs).
+
 ```bash
-sentry                          # starts the monitor (foreground daemon)
-sentry daemon start|stop|status # service mode (optional)
-sentry tail                     # live tail of events with colored risk
-sentry tail --only High,Critical
-sentry run                      # starts the daemon (alias)
+sentry run
+```
+
+### `sentry serve`
+
+Web dashboard (build-step-free SPA) + JSON API in a separate process.
+Requires Postgres. Bind and auth come from `[server]`: `host` (default
+`127.0.0.1`), `port` (default `8080`),
+`auth.mode = "none"|"password"|"token"|"both"` with RBAC (`admin` mutates,
+`viewer` is read-only). Handler in
+[`server.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/server.rs).
+
+Endpoints: `/` (dashboard), `/api/health`, `/api/login`, `/api/logout`,
+`/api/me`, `/api/events`, `/api/stats`, `/api/incidents` (+ `/{id}/ack` and
+`/{id}/resolve`), `/api/ips/blocked` (+ `/{ip}/block`, `/{ip}/unblock`,
+`/{ip}/forgive`).
+
+```bash
+sentry serve
+```
+
+## Live tail
+
+### `sentry tail`
+
+Live event tail straight from Postgres. Opens the [interactive TUI](tui)
+when stdout is a TTY; outside a TTY (or with `--stream`) it prints one line
+per event. Implementation in
+[`tui/mod.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/tui/mod.rs)
+and [`tui/stream.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/tui/stream.rs).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--only <levels>` | (all) | Filter by risk level, comma-separated (e.g. `High,Critical`). |
+| `--tui` | off | Force fullscreen TUI mode. |
+| `--stream` | off | Force non-interactive mode (one line per event). |
+| `--theme <t>` | `dark` | Color theme: `dark`, `light` or `mono`. |
+| `--json` | off | With `--stream`: one JSON object per event (JSONL). |
+
+```bash
+sentry tail --only High,Critical --theme mono
+sentry tail --stream --json | jq 'select(.level == "critical")'
 ```
 
 ## Incidents
 
+### `sentry incidents`
+
+List and inspect unresolved incidents. Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+Ack/resolve happen through the HTTP API (`POST /api/incidents/{id}/ack` and
+`/{id}/resolve`) or the dashboard.
+
+| Subcommand | Description |
+| --- | --- |
+| `list` | Last 50 unresolved incidents. |
+| `show <id>` | Details of one incident (UUID); searches among unresolved ones. |
+
 ```bash
-sentry incidents list           # lists incidents
-sentry incidents show <id>
+sentry incidents list
+sentry incidents show 6ba7b810-9dad-11d1-80b4-00c04fd430c8
 ```
 
 ## IP
 
+### `sentry ip`
+
+Inspect or block/unblock an IP. The IP is positional and comes **before**
+the subcommand; with no subcommand it defaults to `info`. Blocks publish
+`sentry_blocks_changed` (daemon and edge enforce within seconds). Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `info` (default) | Block state, reason, expiry, strikes and total violations. |
+| `block [--ttl <dur>] [--note <text>]` | Block (optionally with expiry). |
+| `unblock` | Remove the block. |
+| `forgive` | Reset the strike counters (offender memory); history is kept. |
+
 ```bash
-sentry ip info <ip>             # history, score, ASN, geo
-sentry ip block <ip> [--ttl 24h]
-sentry ip unblock <ip>
+sentry ip 203.0.113.7 info
+sentry ip 203.0.113.7 block --ttl 24h --note "scanner"
+sentry ip 203.0.113.7 forgive
 ```
 
 ## Routes
 
-```bash
-sentry routes list              # known routes
-sentry routes learn             # baseline mode
-```
+### `sentry routes`
 
-## Reports
+Known routes (config ∪ database). Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs);
+importers in
+[`routes_import.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/routes_import.rs).
 
-```bash
-sentry report --from 24h        # aggregated report
-sentry report --export json|csv
-```
-
-## Config
-
-```bash
-sentry config validate
-sentry config show
-```
-
-## AI model
+| Subcommand | Description |
+| --- | --- |
+| `list` | Lists database routes (or config routes when the DB is empty). |
+| `learn [--dry-run] [--min-hits 10] [--min-ips 2]` | Infers stable route shapes from recent events and persists the new ones. |
+| `import <path> [--format <fmt>] [--dry-run]` | Imports routes from OpenAPI/Swagger 2/3, Postman v2.1 or HAR. `--format`: `openapi`, `swagger`, `postman`, `har`, `auto` (default: auto-detect). |
 
 ```bash
-sentry model status             # model version, accuracy
-sentry model reload
-```
-
-## Tests and detection
-
-```bash
-sentry test detect "<payload>"  # runs the pipeline on an isolated string
-```
-
-## Cloudflare
-
-```bash
-sentry cloudflare status        # syncs state
-sentry cloudflare pull          # imports existing logs
+sentry routes learn --min-hits 20 --min-ips 3
+sentry routes import openapi.yaml --dry-run
 ```
 
 ## Rules engine
 
-```bash
-sentry rules list [--tag vpn] [--enabled] [--source db|config|feed]
-sentry rules show <id>
-sentry rules add --name "block admin from RU" \
-    --match 'country=RU AND path=/admin/*' --action block --priority 10
-sentry rules allow <ip> [--ttl 24h] [--note "monitoring agent"]
-sentry rules block <ip> [--ttl 24h] [--note "scan"]
-sentry rules allow-asn <asn> [--note "our DC"]
-sentry rules block-asn <asn>
-sentry rules enable <id>
-sentry rules disable <id>
-sentry rules delete <id>
-sentry rules import-feed spamhaus      # syncs reputation feed
-sentry rules packs list                # shows packs and state (shadow/enforce/off)
-sentry rules packs enable vpn_proxy --mode enforce
-sentry rules packs disable crawlers_good
-sentry rules test <ip>                 # simulates: which rules would match this IP now
-sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
-```
+### `sentry rules`
 
-## Sentry Auto
+CRUD for custom database rules + view of config packs. Changes publish
+`sentry_rules_changed` (hot-reload, no restart). Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `list` | Database rules + packs declared in `[rules]` (name = mode). |
+| `show <id>` | Details of one rule (match, action, priority, ttl, tags). |
+| `add --name <name> --match <dsl> --action <action> [--priority 100]` | Creates/updates a custom rule (rules engine DSL). |
+| `allow <ip> [--ttl <dur>] [--note <text>]` | Creates an allowlist rule for the IP (priority 1). |
+| `block <ip> [--ttl <dur>] [--note <text>]` | Creates a blocklist rule for the IP. |
+| `enable <id>` / `disable <id>` | Enable/disable a rule. |
+| `delete <id>` | Removes a rule. |
+| `packs` | Lists the built-in default packs and each one's effective mode. |
+| `test [--path /] [--method GET] [--ip <ip>] [--ua <ua>]` | Simulates which rules would match that request shape. |
 
 ```bash
-sentry auto                    # detects framework in cwd, generates sentry.auto.toml
-sentry auto --root /var/www    # specifies project root
-sentry auto --merge            # merge with existing sentry.toml
-sentry auto --dry-run          # only shows what it would detect, no write
-sentry auto --profile wordpress # force a profile (skip detection)
-sentry auto --deep             # AST scan of routes (slow, precise)
-sentry auto list-profiles      # lists supported profiles
+sentry rules add --name "block admin scan" \
+  --match 'path starts_with "/admin" AND country = "RU"' --action block
+sentry rules test --path /.env --ua "sqlmap/1.0" --ip 203.0.113.7
 ```
+
+## Reputation feeds
+
+### `sentry feeds`
+
+Reputation feeds configured in `[[rules.feeds]]` (Tor, Spamhaus, FireHOL,
+datasets…). Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `list` | Name, kind, tier, refresh and URL of each feed. |
+| `refresh` | Fetches all feeds once and shows entry counts (no daemon needed). |
+| `check <ip>` | Refreshes the feeds, then looks the IP up against them. |
+
+```bash
+sentry feeds check 203.0.113.7
+```
+
+## Datasets
+
+### `sentry datasets`
+
+DB-backed datasets (User-Agent, path or JA3 lists) that become
+`dataset:<name>` synthetic rules and feed the dynamic prefilter. Handlers in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs)
+and [`datasets.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/datasets.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `list` | Name, kind, entry count and enabled state. |
+| `import <path> --kind <k> --name <name> [--action log] [--dry-run]` | Imports a list (file or http(s) URL), one entry per line, replacing any previous version of that name. `--kind`: `user_agent`, `path` or `ja3`; `--action`: `allow`, `block`, `challenge`, `rate_limit`, `log` (default) or `tag`. |
+| `enable <name>` / `disable <name>` | Enable/disable without deleting (running daemons hot-reload via NOTIFY). |
+| `delete <name>` | Deletes the dataset. |
+| `fetch` | Re-fetches the `source_url` of every enabled dataset and shows the new counts. |
+
+```bash
+sentry datasets import bad-bots.txt --kind user_agent --name bad-bots --action block --dry-run
+```
+
+## Trusted IPs
+
+### `sentry trusted`
+
+Built-in trusted IP presets for `[real_ip] trusted_lists`. Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `list` | Available presets and which ones are approved in config. |
+
+```bash
+sentry trusted list
+```
+
+## Firewall
+
+### `sentry firewall`
+
+Inspection of the kernel ban backends. Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+Linux-only (reports unavailability elsewhere).
+
+| Subcommand | Description |
+| --- | --- |
+| `status` | Detects nftables/ipset/firewalld, privileges and live set sizes. |
+
+```bash
+sentry firewall status
+```
+
+## Bot verification
+
+### `sentry bots`
+
+rDNS crawler verification (F7.10) — PTR under the engine's domains +
+forward-resolve back to the IP. Uses the system resolver, no daemon needed.
+Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs)
+and [`botdns.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/botdns.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `check <ip> --ua <ua>` | Verifies whether the IP really is the crawler the User-Agent claims. |
+
+```bash
+sentry bots check 66.249.66.1 --ua "Googlebot/2.1"
+```
+
+## Protocols
+
+### `sentry protocol`
+
+Validation and inspection of the protocol DSL schemas (F9). Handlers in
+[`protocol_cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/protocol_cmd.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `validate [dir]` | Compiles every `*.protocol.yaml` in the directory and reports errors. Default: `[protocol] dir`. |
+| `list [dir]` | Lists compiled protocols: ports, messages and policies. |
+| `check <schema> --hex <hex>` | Validates one raw frame (hex) against one schema. |
+
+```bash
+sentry protocol validate
+sentry protocol check schemas/game.protocol.yaml --hex 0001ff
+```
+
+## Auth helpers
+
+### `sentry auth`
+
+Generates the hashes used by `[server.auth]`. Handlers in
+[`auth.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/auth.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `hash-password <password>` | Argon2id hash (PHC format) for `[[server.auth.users]]`. |
+| `token-hash <token>` | SHA-256 hex of the token for `[[server.auth.tokens]]`. |
+
+```bash
+sentry auth hash-password "s3cret!"
+```
+
+## OS service
+
+### `sentry service`
+
+Installs the daemon as a system service: systemd
+(`/etc/systemd/system/sentry.service`), launchd
+(`~/Library/LaunchAgents/com.sentry.daemon.plist`) or a real Windows Service
+(SCM). The service runs `sentry run`. Handler in
+[`service.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/service.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `install [--user <u>] [--workdir <dir>]` | Installs and starts (`--user` is systemd-only; secrets come from the environment). |
+| `uninstall` | Stops and removes the service. |
+| `status` | Install paths + best-effort live status. |
+
+```bash
+sentry service install --user sentry --workdir /etc/sentry
+```
+
+## Reports
+
+### `sentry report`
+
+Postgres aggregate report: events by level and verdict, top IPs and top
+paths. Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--from <dur>` | `24h` | Look-back window (e.g. `24h`, `7d`). |
+| `--export <fmt>` | (text) | `json` or `csv` on stdout. |
+| `--unknown-paths` | off | Top paths without a known route (`UnknownRoute`) — candidates for `[[routes.known]]`. |
+
+```bash
+sentry report --from 7d --export csv
+sentry report --unknown-paths
+```
+
+### `sentry posture`
+
+Web security posture (F11): part 1 is a config checklist (TLS, HTTP→HTTPS
+redirect, posture enabled); part 2 aggregates the header advisories observed
+on the protected site's responses (inline edge, shadow) with a remediation
+hint per line. Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs);
+checks in
+[`posture.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/posture.rs).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--from <dur>` | `24h` | Look-back window for observed advisories. |
+
+```bash
+sentry posture --from 24h
+```
+
+## SIEM export
+
+### `sentry export`
+
+Exports raw events as CEF, LEEF 2.0 or JSON for SIEM consumption.
+Serializers in
+[`siem.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/siem.rs).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--from <dur>` | `24h` | Initial look-back window. |
+| `--format <fmt>` | `cef` | `cef`, `leef` or `json`. |
+| `--out <file>` | (stdout) | Write to a file instead of stdout. |
+| `--follow` | off | Keep tailing new events after the initial window. |
+| `--to <target>` | (—) | With `--follow`: forward via syslog to `udp://host:514` or `tcp://host:514`. |
+
+```bash
+sentry export --from 7d --format leef --out sentry.leef
+sentry export --follow --to udp://siem.internal:514
+```
+
+## Config
+
+### `sentry config`
+
+Validates or prints the resolved config. Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `validate` | Compiles custom rules and protocol schemas, rejects `[posture] mode = "enforce"`, emits edge advisories and prints the summary. |
+| `show` | Prints the resolved config (TOML + env overlay). |
+
+```bash
+sentry config validate
+```
+
+## AI model
+
+### `sentry model`
+
+Lifecycle of the classic ONNX model. Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `status` | Provider, mode (`fork`/`inline`/`shadow`), trigger, threshold, loaded model (needs a build with `--features onnx` to actually load it). |
+| `reload` | Publishes NOTIFY `sentry_model_changed` — the daemon hot-swaps the ONNX from disk (requires Postgres). |
+| `export [--hours 720] [--out dataset.csv] [--synthetic] [--rows 4000] [--confirmed]` | Exports features as CSV (extracted by Rust — training/inference parity). `--synthetic` generates a seed dataset without Postgres; `--confirmed` uses incidents as the positive label. |
+
+```bash
+sentry model export --synthetic --rows 8000 --out seed.csv
+python tools/train_model.py --csv seed.csv
+sentry model reload
+```
+
+## Cloudflare
+
+### `sentry cloudflare`
+
+Cloudflare integration (credentials via `SENTRY_CF_TOKEN`,
+`SENTRY_CF_ZONE` and optionally `SENTRY_CF_ACCOUNT`). Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `status` | Validates the token, shows zone/account, sentry access-rule count and IP List. |
+| `test` | Dry-run verification of token + zone (makes no changes). |
+| `pull` | Lists the access rules created by sentry at the edge (best-effort). |
+
+```bash
+sentry cloudflare status
+```
+
+## Isolated test
+
+### `sentry test`
+
+Runs the pipeline (rules + heuristics + scorer) on a single payload, no
+network or database. Handler in
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--path <p>` | `/` | Simulated path. |
+| `--method <m>` | `GET` | Simulated method. |
+
+```bash
+sentry test "1' OR '1'='1" --path /login --method POST
+```
+
+## Benchmarks
+
+### `sentry bench`
+
+Provider evaluation harness. Handler in
+[`bench_llm.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/bench_llm.rs).
+
+| Subcommand | Description |
+| --- | --- |
+| `llm [--providers jev,mock] [--events <file>] [--format <log_format>] [--n 0] [--concurrency 4] [--out <file>]` | Compares classification providers (LLM / jev / mock) on latency, agreement with the heuristic pipeline, output quality and cost. `--events` accepts an nginx access.log or a `.jsonl` of events; `--n 0` = all. |
+
+```bash
+sentry bench llm --providers jev,openrouter,ollama --n 200
+```
+
+## Environment variables
+
+Secrets never go into committed config — use the environment. Beyond the
+table, every config key can be overridden through env with the `SENTRY_`
+prefix and `__` nesting (e.g. `SENTRY_STORAGE__POSTGRES__URL`); the overlay
+is implemented in
+[`config.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/config.rs).
+
+| Variable | Used by | Read in |
+| --- | --- | --- |
+| `SENTRY_CONFIG` | Config path (equivalent to `--config`). | [`cli.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cli.rs) |
+| `SENTRY_STORAGE__POSTGRES__URL` | Postgres URL. | [`config.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/config.rs) |
+| `SENTRY_CF_TOKEN` | Cloudflare API token (actions + CLI + TUI). | [`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs), [`daemon.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs) |
+| `SENTRY_CF_ZONE` | Cloudflare zone id. | [`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs) |
+| `SENTRY_CF_ACCOUNT` | Account id override (derived from the zone when unset). | [`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs), [`lists.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-cloudflare/src/lists.rs) |
+| `SENTRY_LLM_KEY` | OpenRouter API key ([llm]). | [`daemon.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs) |
+| `SENTRY_JEV_KEY` | `jev` LLM provider key (fallbacks `TYPESAFE_API_KEY` / `JEV_API_KEY`). | [`jev.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/jev.rs) |
+| `SENTRY_SESSION_SECRET` | Dashboard session HMAC key (`[server.auth] session_secret_env`). | [`config.rs` (core)](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs) |
+| `SENTRY_WEBHOOK_SECRET` | Webhook payload HMAC (`[server] webhook_secret_env` and the `webhook` action). | [`config.rs` (core)](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs), [`daemon.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs) |
+| `SENTRY_EDGE_CHALLENGE_SECRET` | JS challenge PoW secret (required with `[edge.challenge] enabled`). | [`config.rs` (core)](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs) |
+| `SENTRY_ABUSEIPDB_KEY` | AbuseIPDB (`[ip_lookup]` and the `report` action). | [`config.rs` (core)](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs) |
+| `SENTRY_REPORTEDIP_KEY` | `report` action key (`reportedip` provider). | [`lib.rs` (report)](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-report/src/lib.rs) |
+| `SENTRY_OPN_API_KEY` / `SENTRY_OPN_API_SECRET` | OPNsense REST credentials. | [`lib.rs` (opnsense)](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-opnsense/src/lib.rs) |

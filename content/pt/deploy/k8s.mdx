@@ -1,66 +1,109 @@
 ---
 title: "Deploy em Kubernetes"
-description: "Manifests Kubernetes e kubectl"
+description: "Manifests Kubernetes, Kustomize e sidecar de edge inline"
 ---
 
 # Deploy em Kubernetes
 
-O Sentry é distribuído com manifests Kubernetes em `deploy/k8s/` para deploy
-em clusters. Os manifests incluem Deployment, Service, ConfigMap e
-Secrets (segredos via env, não no ConfigMap).
+Os manifests ficam em [`deploy/k8s/`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s),
+todos no namespace dedicado `sentry`:
+
+| Manifest | Conteúdo |
+|---|---|
+| [`namespace.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/namespace.yaml) | namespace `sentry` (Pod Security `baseline`) |
+| [`configmap.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/configmap.yaml) | `sentry.toml` não-sensível (packs + source nginx) |
+| [`secret.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/secret.yaml) | `sentry-secrets` (cf-token, cf-zone, llm-key, pg-password) |
+| [`postgres.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/postgres.yaml) | Postgres 16 StatefulSet + PVC 10Gi + Service |
+| [`sentry.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/sentry.yaml) | Deployment do daemon + Service `8080` |
+| [`pdb.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/pdb.yaml) | PodDisruptionBudget (`minAvailable: 1`) |
+| [`kustomization.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/kustomization.yaml) | aplica tudo acima de uma vez |
+| [`edge-sidecar.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/edge-sidecar.yaml) | exemplo separado: edge inline como sidecar da sua app |
 
 ## Aplicar os manifests
 
 ```bash
-kubectl apply -f deploy/k8s/
+kubectl apply -k deploy/k8s/    # via Kustomize (recomendado)
+kubectl apply -f deploy/k8s/    # ou arquivo por arquivo
 ```
 
 ## Verificar o deploy
 
+O namespace é `sentry` — passe `-n` em todos os comandos:
+
 ```bash
-kubectl get pods -l app=sentry
-kubectl logs -f deployment/sentry
-kubectl describe pod -l app=sentry
+kubectl get pods -n sentry
+kubectl logs -f deployment/sentry -n sentry
+kubectl describe pod -n sentry -l app=sentry
 ```
+
+O Deployment tem liveness probe `sentry config validate` — um pod com config
+inválida reinicia com o erro visível em `kubectl logs`.
 
 ## Segredos
 
-Segredos (tokens Cloudflare, LLM key, URL do Postgres) devem ir em Secrets,
-não ConfigMaps:
+Segredos (tokens Cloudflare, LLM key, senha do Postgres) ficam em
+[`secret.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/secret.yaml)
+(`sentry-secrets`) — preencha com valores reais antes do apply:
 
 ```bash
-kubectl create secret generic sentry-secrets \
+kubectl create secret generic sentry-secrets -n sentry \
     --from-literal=cf-token=$SENTRY_CF_TOKEN \
     --from-literal=cf-zone=$SENTRY_CF_ZONE \
     --from-literal=llm-key=$SENTRY_LLM_KEY \
-    --from-literal=pg-url=$SENTRY_STORAGE__POSTGRES__URL
+    --from-literal=pg-password=$SENTRY_PG_PASSWORD
 ```
 
-Os manifests referenciam as secrets via `envFrom: secretRef:` ou
-`valueFrom: secretKeyRef:`.
+O Deployment consome via `valueFrom: secretKeyRef` (`cf-token`, `cf-zone`,
+`llm-key`); o Postgres consome `pg-password`.
 
 ## Postgres
 
-Para produção, use um Postgres gerenciado (ex: Cloud SQL, RDS, ou um
-StatefulSet com PVC). Os manifests de exemplo assumem um Postgres externo
-configurável via `SENTRY_STORAGE__POSTGRES__URL`.
+O [`postgres.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/postgres.yaml)
+sobe um StatefulSet `postgres:16-alpine` com PVC de 10Gi e Service
+`postgres.sentry.svc.cluster.local:5432`. Para produção, um Postgres
+gerenciado (Cloud SQL, RDS, …) também funciona: aponte
+`SENTRY_STORAGE__POSTGRES__URL` para ele e remova o StatefulSet do
+kustomization.
+
+## Edge inline como sidecar
+
+O [`edge-sidecar.yaml`](https://github.com/IDjinn/sentry/blob/main/deploy/k8s/edge-sidecar.yaml)
+mostra a topologia inline ([`sentry-edge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge)):
+o container `sentry-edge` roda com `[deployment] mode = "inline"`, **dona** da
+porta pública do Service (`[edge] listen = "0.0.0.0:80"`) e encaminha para a
+aplicação em `127.0.0.1:8080` — a porta da app nunca é exposta. O mesmo
+binário do daemon, comando/config diferentes:
+
+```bash
+kubectl apply -f deploy/k8s/edge-sidecar.yaml
+```
+
+Para TLS 443 no sidecar, use uma imagem com a feature `edge-tls` e configure
+`[edge] tls_cert/tls_key/tls_listen` (telemetria JA3/JA4 incluída).
 
 ## Escalar horizontalmente
 
-Como o estado (rules, ip_state) é compartilhado em Postgres, múltiplas
-réplicas do Sentry podem rodar em paralelo. Hot-reload de regras via
-`LISTEN/NOTIFY` funciona entre pods (todos escutam o mesmo canal
-`sentry_rules_changed`).
+O estado compartilhado vive no Postgres: regras e blocks sincronizam entre
+pods via `LISTEN/NOTIFY` (`sentry_rules_changed`, `sentry_blocks_changed`) e
+eventos duplicados de nós irmãos são dedupados por `payload_hash` na janela
+de 10s ([F4.7](https://github.com/IDjinn/sentry/blob/main/ARCHITECTURE.md)).
+Limitações documentadas: trackers comportamentais (scan/behavior/offender) e
+o rate-limit in-memory são **por-nó** — para counters compartilhados, use o
+backend Redis (`[rate_limit] backend = "redis"` + feature `rate-redis`).
 
 ```bash
-kubectl scale deployment/sentry --replicas=3
+kubectl scale deployment/sentry -n sentry --replicas=3
 ```
+
+Em multi-nó, dê um `instance_id` distinto por pod (`[deployment] instance_id`)
+para o gauge `sentry_instance_info{instance}`.
 
 ## Atualizar a configuração
 
-Edite o ConfigMap e reinicie o deployment:
+Edite o ConfigMap e reinicie o deployment (regras em DB hot-reloadam via
+NOTIFY, sem restart):
 
 ```bash
-kubectl edit configmap sentry-config
-kubectl rollout restart deployment/sentry
+kubectl edit configmap sentry-config -n sentry
+kubectl rollout restart deployment/sentry -n sentry
 ```

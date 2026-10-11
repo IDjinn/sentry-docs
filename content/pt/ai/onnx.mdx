@@ -1,63 +1,124 @@
 ---
 title: "Modelo ONNX Local"
-description: "Camada 1 — ThreatModel via ort (ONNX Runtime)"
+description: "ThreatModel clássico (features → sklearn → ONNX) via ort, com retreinamento hot-swap"
 ---
 
 # Modelo ONNX Local
 
-A Camada 1 do Sentry usa um modelo ONNX local para classificar payloads
-suspeitos que as heurísticas não conseguem decidir com confiança. Inferência
-local via `ort` (ONNX Runtime), sem depender de API externa.
+O modelo local do Sentry é um classificador ML clássico (regressão logística)
+que roda como [fork assíncrono](./index) ao lado do hot path. Inferência é
+local — sem rede, determinística, tipicamente sub-ms — via `ort` (ONNX
+Runtime), atrás da feature Cargo `onnx` (opcional, desligada por default).
 
 ## Trait `ThreatModel`
 
 ```rust
-// sentry-ai/src/threat.rs
+/// A local, deterministic, no-network threat model.
 #[async_trait]
 pub trait ThreatModel: Send + Sync {
     fn name(&self) -> &'static str;
     fn version(&self) -> &str;
-    async fn classify(&self, evt: &Event) -> anyhow::Result<ThreatVerdict>;
+    async fn analyze(&self, evt: &Event) -> anyhow::Result<Vec<Signal>>;
 }
 ```
 
-A feature `onnx` é **opcional** e desligada por default. Ative via Cargo
-feature no build:
+Definida em
+[`sentry-ai/src/threat.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/threat.rs#L17-L28)
+— o pipeline depende de um `Box<dyn ThreatModel>` sem puxar `ort` para todo
+build. A implementação ONNX é
+[`OnnxThreatModel`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/onnx_model.rs#L28)
+(feature `onnx`), carregada pelo daemon em
+[`build_ai_fork`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2262)
+quando `[ai] enabled = true`. Sem a feature, o estágio fica desligado com um
+warning — o resto do Sentry continua funcionando.
 
-```toml
-[dependencies]
-sentry-ai = { version = "0.1", features = ["onnx"] }
-```
+[`load`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/onnx_model.rs#L37)
+valida a largura da entrada do modelo contra `FEATURE_NAMES`: um modelo
+treinado com outra versão das features falha no startup com instrução de
+retreinar, nunca roda dessincronizado. Probabilidade de anomalia acima de
+`threshold` emite um sinal `AnomalousPayload` com peso `signal_weight`.
 
-## Pipeline de treinamento
+## Features — a fonte única de verdade
 
-1. **Dataset**: payloads maliciosos catalogados (SQLi, XSS, RCE, log4shell)
-   + tráfego benigno.
-2. **Treinamento offline** (Python, em `tools/train`) — produz um modelo
-   ONNX versionado.
-3. **Versionamento**: modelos em `models/` (ex: `models/sentry-payload-v1.onnx`).
-4. **Deploy**: binário carrega o modelo no startup; troca a quente via
-   `sentry model reload`.
-5. **Feedback loop**: incidentes confirmados pelo decisor viram dataset de
-   retreinamento.
+[`sentry-ai/src/features.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/features.rs)
+é o **single source of truth** do input do modelo: a mesma função `extract`
+roda na inferência (fork do daemon) e no export de treino (`sentry model
+export` escreve CSV com header = `FEATURE_NAMES`). O script de treino valida
+o header do CSV e falha alto se as pontas divergirem — treino e inferência
+não podem driftar.
 
-## Configuração
+São 25 features, todas normalizadas para `0.0–1.0` (vetor de tamanho fixo;
+eventos não-HTTP viram vetor de zeros). Resumo por grupo:
 
-```toml
-[analysis.ai]
-onnx_model = "models/sentry-payload-v1.onnx"
-llm_only_above = 30
-```
+| Grupo | Features |
+| --- | --- |
+| Estrutura do path | `path_len`, `query_len`, `path_depth`, `path_digit_ratio`, `path_special_ratio`, `path_entropy`, `path_encoded_count`, `path_dot_dot`, `path_null_byte` |
+| Tokens de ataque (sobre texto URL-decodificado + lowercase) | `sqli_token_score`, `xss_token_score`, `traversal_token_score`, `jndi_token`, `cmd_token_score` |
+| Extensão do arquivo | `has_file_ext`, `ext_is_script`, `ext_is_sensitive` |
+| Método HTTP | `method_is_get`, `method_is_post` |
+| User-Agent | `ua_len`, `ua_is_empty`, `ua_bot_token` |
+| Status da resposta | `status_4xx`, `status_5xx` |
+| Query string | `query_param_count` |
 
-## CLI
+## Loop de retreinamento
+
+A extração de features acontece **exclusivamente em Rust** — o script Python
+só consome os vetores exportados. O ciclo completo:
+
+1. **Export** — `sentry model export` ([handler](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs#L1045),
+   [flags](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cli.rs#L477))
+   grava um CSV (`FEATURE_NAMES,label`) com as features extraídas pelo Rust
+   sobre eventos recentes do Postgres:
+   - `--hours N` — janela de busca (default 720 = 30 dias);
+   - `--out <arquivo>` — destino (default `dataset.csv`);
+   - `--synthetic` — dataset seed sintético sem Postgres (`--rows`, default
+     4000, metade benigna);
+   - `--confirmed` — labels de incidentes confirmados (evento ligado a
+     incidente = 1, resto = 0). Sem a flag, positivos são os eventos com
+     verdict `block`/`challenge`/`rate_limit`.
+2. **Treino** — `tools/train_model.py`
+   ([`tools/train_model.py`](https://github.com/IDjinn/sentry/blob/main/tools/train_model.py)):
+   `StandardScaler + LogisticRegression` (sklearn, `class_weight="balanced"`)
+   avaliado em holdout, exportado para ONNX com `zipmap: false`
+   (probabilidades como tensor float plano).
+3. **Substituição** — troque o arquivo apontado por `model_path` (o seed
+   commitado é [`models/anomaly_v1.onnx`](https://github.com/IDjinn/sentry/blob/main/models/anomaly_v1.onnx)).
+4. **Hot swap** — `sentry model reload`
+   ([handler](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs#L1028))
+   envia `NOTIFY sentry_model_changed` via Postgres; o daemon recarrega o
+   arquivo do disco e troca o modelo a quente
+   ([listener](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2952)),
+   com o modelo vivo em `Arc<RwLock<Arc<dyn ThreatModel>>>`. Falha de carga
+   mantém o modelo anterior.
+5. **Status** — `sentry model status`
+   ([handler](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs#L979))
+   mostra enabled, path, mode/trigger/threshold, se o arquivo carrega (com
+   `--features onnx`) e o provider LLM ativo.
 
 ```bash
-sentry model status             # versão do modelo, acurácia
-sentry model reload             # recarrega modelo do disco (hot swap)
+sentry model export --synthetic
+python tools/train_model.py --csv dataset.csv --out models/anomaly_v1.onnx
+sentry model reload    # exige Postgres: o daemon escuta NOTIFY sentry_model_changed
+sentry model status
 ```
 
-## Status
+O build precisa da feature: `cargo build --release --features sentry-cli/onnx`.
 
-- Trait `ThreatModel` em `sentry-ai/src/threat.rs`.
-- Feature `onnx` existe no Cargo.toml.
-- **Impl ONNX pendente** (F2.1/F2.2) — sem `tools/` ainda.
+## Configuração `[ai]`
+
+```toml
+[ai]
+enabled = false
+model_path = "models/anomaly_v1.onnx"
+threshold = 0.7             # prob. de anomalia que emite o sinal
+signal_weight = 25          # peso do AnomalousPayload (override: [scorer.weights])
+mode = "fork"               # fork | inline | shadow
+trigger = "above_score"     # above_score | always | quarantine_only
+min_score = 20              # gate de score do hot path (above_score)
+concurrency = 4             # inferências paralelas (fork mode)
+cache_ttl_secs = 300        # cache de resultados por hash do payload
+```
+
+Chaves e defaults em [`AiConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1207).
+O que `mode`/`trigger`/cache fazem em runtime está descrito em
+[Camada de IA](./index#modos-fork--inline--shadow).

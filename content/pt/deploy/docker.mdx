@@ -1,51 +1,106 @@
 ---
 title: "Deploy com Docker"
-description: "Docker Compose e variáveis de ambiente"
+description: "Dockerfile, Docker Compose e variáveis de ambiente"
 ---
 
 # Deploy com Docker
 
-O Sentry é distribuído com um `Dockerfile` e `docker-compose.yml` que sobem
-o binário + Postgres em um único comando.
+Os arquivos de deploy ficam em [`deploy/docker/`](https://github.com/IDjinn/sentry/blob/main/deploy/docker):
+um [`Dockerfile`](https://github.com/IDjinn/sentry/blob/main/deploy/docker/Dockerfile)
+multi-stage e dois composes —
+[`docker-compose.yml`](https://github.com/IDjinn/sentry/blob/main/deploy/docker/docker-compose.yml)
+(dev/single-node) e
+[`docker-compose.prod.yml`](https://github.com/IDjinn/sentry/blob/main/deploy/docker/docker-compose.prod.yml)
+(override de produção).
 
-## Docker Compose (recomendado para produção)
+## A imagem
+
+O [`Dockerfile`](https://github.com/IDjinn/sentry/blob/main/deploy/docker/Dockerfile)
+compila o binário em `rust:1.97-bookworm` e copia para um runtime
+`debian:bookworm-slim` com `tini`, `libpq5` e usuário não-root `sentry`.
+Defaults do runtime: `SENTRY_CONFIG=/etc/sentry/sentry.toml`, porta exposta
+`8080` (dashboard/API de `[server]`), entrypoint `sentry` com comando default
+`run`.
+
+Cargo features pesadas (ONNX, TLS, zstd, pcap, redis) são **opt-in** — o build
+default não as inclui. Passe-as via build ARG `FEATURES`:
 
 ```bash
-docker build -t sentry .
+docker build -t sentry --build-arg FEATURES=sentry-cli/edge-tls,sentry-cli/edge-zstd .
+```
+
+## Docker Compose (dev / single-node)
+
+```bash
 docker compose -f deploy/docker/docker-compose.yml up -d
 ```
 
-O compose sobe dois serviços:
+O compose faz o build a partir da raiz do repo e sobe dois serviços:
 
-- `sentry` — o binário do Sentry (lê logs do nginx, roda o pipeline,
-  despacha actions).
-- `postgres` — banco Postgres para events, incidents, rules, routes,
-  ip_state.
+- `postgres` — `postgres:16-alpine` com healthcheck (`pg_isready`); a porta
+  `5432` fica publicada (conveniência de dev — feche em produção).
+- `sentry` — o daemon (`sentry run`), dependendo do healthcheck do Postgres,
+  com o [`sentry.example.toml`](https://github.com/IDjinn/sentry/blob/main/config/sentry.example.toml)
+  montado read-only em `/etc/sentry/sentry.toml` e volume `sentrydata` em
+  `/var/lib/sentry`.
+
+O compose aceita as variáveis `SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`,
+`SENTRY_LLM_KEY` e `SENTRY_PG_PASSWORD` (senha do Postgres, default
+`changeme`).
+
+## Override de produção
+
+O [`docker-compose.prod.yml`](https://github.com/IDjinn/sentry/blob/main/deploy/docker/docker-compose.prod.yml)
+ajusta o compose para um host de produção real:
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml \
+               -f deploy/docker/docker-compose.prod.yml up -d
+```
+
+Diferenças: `sentry` roda como root (para ler logs de nginx cujo dono não é o
+usuário do container), Postgres **sem** porta publicada no host, monta um
+`sentry.toml` real (gitignored) no lugar do example, monta os logs do nginx
+(`/www/wwwlogs` → `/var/log/nginx`, read-only) e `restart: always`.
 
 ## Variáveis de ambiente
 
-Segredos vão em env vars, nunca no config commitado:
+Segredos vão em env vars, nunca no config commitado. O overlay de env
+(`SENTRY_<SECTION>__<KEY>`, figment) sobrescreve qualquer campo do TOML:
 
 ```bash
 export SENTRY_CF_TOKEN=xxx        # Cloudflare API token (opcional)
 export SENTRY_CF_ZONE=yyy         # Cloudflare zone ID (opcional)
-export SENTRY_LLM_KEY=zzz         # OpenRouter key (opcional)
+export SENTRY_LLM_KEY=zzz         # LLM key (opcional)
 export SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
+export SENTRY_SESSION_SECRET=...  # HMAC dos cookies do dashboard (auth ligado)
 ```
 
-O overlay de env (`SENTRY_<SECTION>__<KEY>`) sobrescreve qualquer campo do
-TOML.
+## Volumes e portas
 
-## Volumes
+- `/var/lib/sentry` — data dir (MMDB GeoLite2, modelo ONNX, cache local).
+- `/var/log/nginx` — access.log tailado pela source nginx (read-only).
+- `pgdata` / `sentrydata` — volumes gerenciados pelo compose.
 
-- `/var/lib/sentry` — data dir (modelos ONNX, MMDB, cache local).
-- `/var/log/nginx` — access.log tailado pela source nginx.
-- Postgres data — volume gerenciado pelo compose.
+O compose **não publica** nenhuma porta do serviço `sentry`: o modo default é
+`passive` (sem listener de rede). Para rodar a **edge inline** (WAF na frente
+da aplicação), configure `[deployment] mode = "inline"` + `[edge]` no
+`sentry.toml` e publique as portas:
+
+```yaml
+services:
+  sentry:
+    ports:
+      - "80:80"      # [edge] listen
+      - "443:443"    # [edge] tls_listen (requer image com edge-tls)
+      - "127.0.0.1:8080:8080"  # dashboard `sentry serve` / [server]
+      - "127.0.0.1:9100:9100"  # /metrics Prometheus ([metrics])
+```
 
 ## Config
 
-Monte seu `sentry.toml` no container (ex: em `/etc/sentry/sentry.toml`) ou
-use só env vars. Exemplo de `docker-compose.yml` override:
+Monte seu `sentry.toml` no container (padrão: `/etc/sentry/sentry.toml`, via
+`SENTRY_CONFIG`) ou use só env vars. Exemplo de override do compose:
 
 ```yaml
 services:
@@ -77,7 +132,8 @@ volumes:
 
 ## Logs
 
-O Sentry usa `tracing` para structured logging. Veja os logs do container:
+O Sentry usa `tracing` para structured logging (`RUST_LOG=info,sentry=debug`
+no compose). Veja os logs do container:
 
 ```bash
 docker compose -f deploy/docker/docker-compose.yml logs -f sentry

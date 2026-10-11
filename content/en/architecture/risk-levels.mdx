@@ -1,55 +1,128 @@
 ---
 title: "Risk Levels and Verdicts"
-description: "Score, levels and default verdicts"
+description: "Score, levels, signal weights, policy and repeat-offender escalation"
 ---
 
 # Risk Levels and Verdicts
 
-The scorer combines signals from heuristics, AI and the route validator into a
-`risk_score` (0–100) and a `risk_level`. The decider then maps the level to a
-default verdict, applicable per policy.
+The scorer ([`pipeline.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs))
+sums the weights of the [`Signal`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L77)s
+produced by rules, heuristics, trackers and forks into a `risk_score`
+(0–100) and maps it to a
+[`RiskLevel`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L18).
+The [`VerdictPolicy`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/policy.rs)
+turns the level into the final verdict, which can then be overridden by
+policy and by repeat-offender escalation.
 
-| Score  | Level    | Color    | Default verdict                   |
-|--------|----------|----------|-----------------------------------|
-| 0–9    | Info     | gray     | Allow                             |
-| 10–29  | Low      | blue     | Allow + observation               |
-| 30–49  | Medium   | yellow   | Increasing rate-limit             |
-| 50–74  | High     | orange   | Challenge (Cloudflare)            |
-| 75–100 | Critical | red      | Block IP + alert                  |
+## Score → level → verdict
 
-Policy is configurable per route/IP-range/ASN. E.g. `/admin/*` has a lower
-threshold.
+| Score | Level | Color (TUI) | Default verdict (`[policy]`) |
+| --- | --- | --- | --- |
+| 0–9 | Info | gray | `allow` |
+| 10–29 | Low | blue | `allow` |
+| 30–49 | Medium | yellow | `rate_limit` |
+| 50–74 | High | orange | `challenge` |
+| 75–100 | Critical | red | `block` |
 
-## Initial signal weights
+- The level buckets are fixed (stable dashboards); the **verdict per
+  level** is configurable in `[policy]` (`info`/`low`/`medium`/`high`/
+  `critical`), and ordered `[[policy.override]]` entries (DSL `match` →
+  `verdict`) win on first match.
+- Short-circuit rules enter with a fixed score: Block = 100,
+  Challenge = 50, RateLimit = 30, Quarantine = 40
+  ([`process`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L465)).
+- The sum is **capped at 100** and gains a repetition bonus in a sliding
+  window (`repetition_window_secs`, 60 s) when the same IP repeats
+  signals.
 
-| Signal                              | Weight | Accumulates? |
-|-------------------------------------|--------|--------------|
-| SQLi (regex)                        | 60     | no           |
-| XSS (regex)                         | 45     | no           |
-| Path traversal (`../`, `%2e`)       | 40     | yes          |
-| Log4Shell (`${jndi:`)               | 80     | no           |
-| RCE/cmd injection                   | 70     | no           |
-| Non-existent route                  | 8      | yes          |
-| >10 404/IP in 60s                   | 35     | —            |
-| Empty/suspicious user-agent         | 10     | yes          |
-| Tor exit node                       | 15     | —            |
-| IP in reputation feed               | 50     | —            |
-| Promiscuous scanner (`promiscuous` feed) | 10 | —            |
-| Scan→attack cross-IP (`[correlation]`)   | 20 | yes          |
-| ONNX anomaly > 0.8                  | 50     | no           |
-| Access to sensitive path           | 30     | yes          |
+## Default signal weights
 
-Weights combine (sum capped at 100), with a bonus for repetition within a
-window. **Everything is configurable.**
+Every weight is overridable in `[scorer.weights]` by the signal key
+(e.g. `sql_injection = 80`). Defaults verified in code:
+
+| Signal | Weight | Source |
+| --- | --- | --- |
+| `log4shell` | 80 | [`heuristics.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs) |
+| `rce` / cmd injection | 70 | heuristics |
+| `sql_injection` | 60 | heuristics |
+| `upload_polyglot` | 60 | [`analysis.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L209) (F10) |
+| `lfi` | 50 | heuristics |
+| `known_bad_ip` | 50 | [`reputation.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L23) |
+| `upload_executable` | 50 | analysis.rs (F10) |
+| `suspicious_login_success` | 45 | [`behavior.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/behavior.rs#L34) |
+| `xss` | 45 | heuristics |
+| `path_traversal` | 40 | heuristics |
+| `credential_stuffing` | 40 | behavior.rs |
+| `bad_crawler` | 40 | heuristics |
+| `upload_type_mismatch` | 30 | analysis.rs (F10) |
+| `upload_disallowed` | 30 | analysis.rs (F12) |
+| `sensitive_path` | 30 | heuristics |
+| `directory_brute_force` | 30 | behavior.rs |
+| `tcp_scanner` | 30 | heuristics (SYN fingerprint) |
+| `auth_brute_force` | 35 | behavior.rs |
+| `scan_behavior` | 35 | [`scan.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/scan.rs#L27) |
+| `spoofed_bot` | 35 | [`botverify.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L326) (F7.7) |
+| `random_scan` | 25 | scan.rs |
+| `upload_flood` | 25 | analysis.rs (F10) |
+| `anomalous_payload` (ONNX) | 25 | [`onnx_model.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/onnx_model.rs#L165) (`[ai] signal_weight`) |
+| `protocol_violation` | 25 | analysis.rs (F9; schemas override per policy) |
+| `vpn_proxy` | 20 | reputation.rs |
+| `tls_sni_mismatch` | 20 | analysis.rs (F8) |
+| `upload_oversize` | 20 | analysis.rs (F12) |
+| `scan_attack_correlation` | 20 | [`correlation.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/correlation.rs) (F3.10) |
+| `tor_exit_node` | 15 | reputation.rs |
+| `promiscuous_scanner` | 10 | reputation.rs (F3.10) |
+| `suspicious_ua` / empty UA | 10 | heuristics |
+| `method_not_allowed` | 10 | pipeline.rs (route validator) |
+| `unknown_route` | 8 | pipeline.rs |
+| `llm_malicious` | score × confidence | LLM fork (F3.5) |
+| `external_reputation` | scaled by `abuseConfidenceScore` | external lookup (F7.5) |
+| `posture_advisory` | **0 (locked)** | [`posture.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/posture.rs) (F11) |
+
+### The `PostureAdvisory` nuance (F11)
+
+Posture advisories describe the **protected site** (missing security
+headers on the upstream response), never the visitor. The weight is the
+`POSTURE_ADVISORY_WEIGHT = 0` constant and
+[`weight_for`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L815)
+returns 0 **before** consulting `[scorer.weights]` — no configuration can
+turn an advisory into enforcement. The signal shows up in dashboards,
+metrics and `sentry posture`, but never changes score, verdict or
+webhooks.
+
+## Repeat-offender escalation (F2.12)
+
+Every event whose final verdict is not `Allow` records one strike in the
+IP's [`OffenderTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/offender.rs).
+Strikes expire after `window_secs` (default **7 days** — outlives the 24 h
+edge-rule TTL). Escalation **only raises** the verdict:
+
+- `challenge_at` (default **3**) strikes → at least Challenge.
+- `block_at` (default **5**) strikes → Block.
+- `persist = true` mirrors strikes to the `ip_state` table (Postgres) and
+  pre-warms the tracker on startup — a returning offender past the edge
+  TTL is re-blocked on its first violating event.
+
+`Allow` never records a strike (no ratchet against benign traffic).
+
+## Guards that override everything
+
+- **Trusted IPs** (F7.2): IPs in `[real_ip] trusted_ips` get an immediate
+  Allow and are immune even to `rescore_from` — the "you can't lock
+  yourself out" guard.
+- **Shadow IPs**: `Block`/`Quarantine` are downgraded to `Challenge`
+  (`cap_shadow`) — fully analyzed and logged, never banned.
+- **Blacklist**: an IP on `[real_ip] blacklist` is blocked (score 100)
+  before any detector.
 
 ## Cross-IP scan→attack correlation (F3.10)
 
-The honeypot "shot calling" pattern: a scan (404 sweep, masscan/zmap SYN, …)
-from a "clean" IP followed by an exploit/brute-force from a **different** IP
-in the same /24 (IPv4), /64 (IPv6) or ASN within the window emits
-`ScanAttackCorrelation` (weight 20) — an aggravator on top of the attack,
-never a detector by itself. SYNs captured by the `tcp` source feed the same
-window as HTTP 404 sweeps.
+The "shot calling" pattern observed in honeypots: a scan (404 sweep,
+masscan/zmap SYNs, …) from a "clean" IP followed by an exploit/brute-force
+from **another** IP in the same /24 (IPv4), /64 (IPv6) or ASN within the
+window emits `ScanAttackCorrelation` (weight 20) — an aggravator of the
+attack, never a standalone detector. SYNs captured by the `tcp` source
+feed the same window as HTTP sweeps.
 
 ```toml
 [correlation]
@@ -57,8 +130,8 @@ enabled = true
 window_secs = 900           # 15 min
 ```
 
-Alongside it comes the scanner taxonomy as reputation tiers: `authorized`
-(contracted scanner — no signal; trust them with
-`reputation=authorized` → allow) and `promiscuous` (publishes recon data
-anyone can query → `PromiscuousScanner`, weight 10 — a scanner that
-publishes recon for anyone is not benign).
+Alongside comes the scanner taxonomy as reputation tiers: `authorized`
+(a contracted scanner — no signal; trust with `reputation = "authorized"`
+→ allow) and `promiscuous` (publishes recon for anyone to query →
+`PromiscuousScanner`, weight 10 — a scanner that publishes recon for
+anyone is not benign).

@@ -1,0 +1,143 @@
+---
+title: "API — sentry-storage"
+description: "Referência do sentry-storage: pool Postgres, repositórios tipados, migrations, dedupe por payload_hash e LISTEN/NOTIFY"
+---
+
+# API — `sentry-storage`
+
+[`sentry-storage`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/lib.rs#L1) é a persistência Postgres do Sentry: pool, migrations embutidas e repositórios tipados (events, incidents, ip_state, rules, routes, datasets) usados pelo daemon, pela CLI e pelo dashboard. Todas as queries usam `sqlx::query()` em runtime, então a crate compila sem um `DATABASE_URL` vivo. Declara `#![forbid(unsafe_code)]`.
+
+## Pool — módulo `pool`
+
+### PgPool
+
+```rust
+pub struct PgPool { /* sqlx::PgPool */ }
+pub async fn connect(cfg: &PostgresConfig) -> Result<Self>;
+pub fn connect_lazy(url: &str) -> Result<Self>;
+pub async fn listen(&self, channel: &str) -> Result<sqlx::postgres::PgListener>;
+pub async fn notify(&self, channel: &str) -> Result<()>;
+```
+
+[`PgPool`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/pool.rs#L9) respeita `max_connections` e `acquire_timeout_secs` do `[storage.postgres]`; [`connect_lazy`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/pool.rs#L34) adia a conexão (tooling/testes). [`listen`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/pool.rs#L52) usa uma conexão dedicada fora do pool — o LISTEN pode bloquear indefinidamente sem starvation. Erros ficam em [`StorageError`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/pool.rs#L76) (`Config`/`Connect`/`Query`/`Migrate`).
+
+## Repositórios — módulo `repo`
+
+### Repo
+
+[`Repo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L22) carrega o pool e empresta os repos: [`events()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L38), [`incidents()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L45), [`ip_state()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L52), [`rules()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L59), [`routes()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L66), [`datasets()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L73). Todos os métodos de IP canonizam o endereço ([`Event::canonical_ip`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L243)).
+
+### Tipos de linha
+
+Cada tabela tem seu struct `FromRow`/serde — são eles que atravessam a fronteira daemon ↔ CLI ↔ dashboard:
+
+| Tipo | Tabela | Notas |
+| --- | --- | --- |
+| [`EventRow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L168) | `events` | Linha completa: `protocol`/`signals` em JSONB, `duration_ms`/`process_us` |
+| [`EventInsert`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L91) | `events` | Payload de insert em lote; `payload_hash: Option<i64>` alimenta o dedupe |
+| [`IncidentRow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L620) | `incidents` | `client_ip`, `acknowledged_at`, `resolved`, `notes` |
+| [`IpStateRow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L779) | `ip_state` | `status`, `reason`, `expires_at` (bloqueio com TTL) |
+| [`OffenderRow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L947) | `ip_state` | Projeção de `strikes`/`total_violations`/`last_violation_at` |
+| [`RuleRow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L968) | `rules` | `match_expr` textual (compilado pelo DSL no `load_ruleset`) |
+| [`RouteRow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1132) | `routes` | `path` + `methods[]`; implementa `RouteLike` |
+| [`DatasetRow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1236) | `datasets` | `kind`, `source_url`, `action`, `enabled`, `entry_count` |
+
+### EventRepo
+
+Repositório da tabela `events` ([`EventRepo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L84)).
+
+**Escrita e dedupe cross-node:**
+
+```rust
+pub async fn insert_with_hash(&self, evt: &Event, risk_score: u8, risk_level: RiskLevel,
+    verdict: Verdict, signals: &serde_json::Value, payload_hash: Option<i64>, process_us: Option<u64>) -> Result<()>;
+pub async fn insert_batch_with_hash(&self, rows: &[EventInsert]) -> Result<()>;
+```
+
+[`insert_with_hash`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L223) faz INSERT condicional: quando `payload_hash` já foi persistido por um nó irmão na janela de dedupe (10 s), a linha é pulada — o LRU local não enxerga eventos de outros nós (F4.7). [`insert_batch_with_hash`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L339) é a lane de persistência em lote do overload response (1 multi-INSERT por lote). [`EventInsert::from_event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L134) monta a linha; protocolo que falha ao serializar vira JSON `null` — lote não perde evento por um payload ruim.
+
+**Leitura e agregações:**
+
+| Método | Uso |
+| --- | --- |
+| [`recent`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L372) / [`recent_since`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L415) | TUI e dashboard |
+| [`recent_for_ip`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L392) | Popup de info de IP na TUI |
+| [`update_verdict`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L434) | Feedback pós-AI/LLM |
+| [`count_by_level_since`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L486) / [`count_by_verdict_since`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L596) | `/api/stats`, relatórios |
+| [`queries_per_hour`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L500) | Série temporal |
+| [`top_ips`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L518) / [`top_paths`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L535) / [`top_unknown_paths`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L553) | Rodapé da TUI, `report --unknown-paths` |
+| [`posture_findings`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L576) | `sentry posture`: agrega `signals` JSONB filtrando `posture_advisory`, group by host+detail (sem migration) |
+| [`incident_event_ids`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L460) | Labels de `sentry model export --confirmed` |
+
+### IncidentRepo
+
+Repositório da tabela `incidents` ([`IncidentRepo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L614)): [`create`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L645), [`get_or_create_for_event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L672) (idempotente por `event_id` — índice único parcial), [`open_incident_for_ip`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L715) (coalescência: 1 incidente aberto por IP), [`unresolved`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L730), [`ack`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L757) e [`resolve`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L747) (round-trip dos webhooks com `ack_url`).
+
+### IpStateRepo
+
+Repositório da tabela `ip_state` ([`IpStateRepo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L773)) — fonte da verdade de bloqueios e da memória de reincidentes:
+
+| Método | Papel |
+| --- | --- |
+| [`block`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L794) / [`unblock`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L858) | Escreve/remove bloqueio (com TTL) |
+| [`is_blocked`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L820) / [`blocked`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L842) | Consulta e listagem (pre-warm da `BlockTable` no startup) |
+| [`record_violation`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L873) | Strike + total (janela configurável; strikes decaem fora da janela) |
+| [`offender`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L897) / [`recent_offenders`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L911) / [`reset_offender`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L930) | `sentry ip forgive` e relatórios |
+
+### RuleRepo
+
+Repositório da tabela `rules` ([`RuleRepo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L962)): [`load_ruleset`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L995) compila as linhas (`match_expr` via DSL) num [`RuleSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L188) carregado no startup; [`upsert`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1054), [`delete`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1087), [`list`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1097) e [`set_enabled`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1111) servem à CLI/dashboard.
+
+### RouteRepo
+
+Repositório da tabela `routes` ([`RouteRepo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1126)): [`list`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1154), [`insert`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1165) e [`delete`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1179). [`RouteRow`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1132) implementa a trait [`RouteLike`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L45) do core, então entra direto no [`RouteValidator::merge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L120) (config ∪ DB).
+
+### DatasetRepo
+
+Repositório dos datasets DB-backed (F7.7, [`DatasetRepo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1230)) — listas curadas `user_agent`/`path`/`ja3` que viram regras sintéticas `feed:<name>` e alimentam o prefilter dinâmico:
+
+```rust
+pub async fn upsert(&self, name: &str, kind: &str, source_url: Option<&str>,
+    action: &str, entries: &[String]) -> Result<()>;
+pub async fn list(&self) -> Result<Vec<DatasetRow>>;
+pub async fn entries(&self, name: &str) -> Result<Vec<String>>;
+pub async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()>;
+pub async fn delete(&self, name: &str) -> Result<()>;
+```
+
+[`upsert`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1257) substitui o dataset wholesale numa transação e dispara `pg_notify` no canal `sentry_datasets_changed` ([constante](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1251)); `set_enabled` e `delete` notificam igual — todos os nós hot-reloadam sem restart.
+
+## Migrations
+
+Embutidas via [`sqlx::migrate!`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/migrations.rs#L11) (`migrations::run` no startup). Arquivos em `crates/sentry-storage/migrations/`:
+
+| Migration | Conteúdo |
+| --- | --- |
+| [`20260101000000_init.sql`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/migrations/20260101000000_init.sql) | Tabelas `events`, `incidents`, `rules`, `ip_state` + índices base |
+| [`20260102000000_routes.sql`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/migrations/20260102000000_routes.sql) | Tabela `routes` (hot-reloadable via LISTEN/NOTIFY) |
+| [`20260821000000_offenders.sql`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/migrations/20260821000000_offenders.sql) | `strikes`/`total_violations`/`last_violation_at` em `ip_state` (F2.12) |
+| [`20260930000000_incident_feedback.sql`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/migrations/20260930000000_incident_feedback.sql) | `incidents.client_ip` + `acknowledged_at` + índice único em `event_id` (F4.5) |
+| [`20261001000000_ha.sql`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/migrations/20261001000000_ha.sql) | `events.payload_hash` + índice parcial (dedupe cross-node, F4.7) |
+| [`20261002000000_datasets.sql`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/migrations/20261002000000_datasets.sql) | Tabelas `datasets`/`dataset_entries` (F7.7) |
+| [`20261003000000_event_timings.sql`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/migrations/20261003000000_event_timings.sql) | `events.duration_ms`/`process_us` |
+
+## Dedupe e LISTEN/NOTIFY
+
+O **dedupe cross-node** (F4.7) funciona assim: cada nó calcula o mesmo `payload_hash` que o LRU local usa (IP + método + path para HTTP, hash do raw caso contrário); o INSERT compara contra o índice parcial `events_payload_hash_ts` na janela de 10 s e pula duplicatas persistidas por irmãos. O índice é parcial (`WHERE payload_hash IS NOT NULL`) — eventos sem hash nunca pagam o lookup.
+
+Canais de **hot-reload** por LISTEN/NOTIFY (produtores → tarefas LISTEN no daemon):
+
+| Canal | Dispara |
+| --- | --- |
+| `sentry_rules_changed` | Recompila o ruleset ([daemon](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2781)) |
+| `sentry_datasets_changed` | Reimporta datasets no pipeline e no prefilter ([daemon](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2863); emitido pelo `DatasetRepo`) |
+| `sentry_blocks_changed` | Re-sincroniza a `BlockTable` entre nós ([daemon](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2904)) |
+| `sentry_model_changed` | Troca o ONNX a quente ([daemon](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/daemon.rs#L2961)) |
+
+O productor typical é a CLI/dashboard: mutação no Postgres + `NOTIFY` via [`PgPool::notify`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/pool.rs#L64). A exceção é `sentry_datasets_changed`, emitido dentro do próprio [`DatasetRepo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L1230) na mesma transação da escrita.
+
+## Notas de operação
+
+- [`EventRepo::insert`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/repo.rs#L205) é o wrapper single-row sem dedupe (delega a `insert_with_hash` com `payload_hash = None`) — caminhos de baixo volume; o caminho quente do daemon usa a lane em lote.
+- `Repo` é `Clone` barato (só o handle do pool); cada repo emprestado também. Não há estado por repo — a fonte de verdade vive no Postgres, e caches locais (`BlockTable`, ruleset) são sincronizados pelos canais acima.
+- O módulo [`error`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/src/error.rs#L3) re-exporta `StorageError`/`Result` definidos em `pool.rs`; toda falha de query vira `StorageError::Query` com o erro do sqlx no texto.

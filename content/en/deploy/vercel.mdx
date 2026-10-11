@@ -5,12 +5,13 @@ description: "Deploying the docs site on Vercel"
 
 # Documentation Deploy on Vercel
 
-The Sentry documentation is a **Fumadocs** app (Next.js + MDX) separate from
-the Rust binary, deployed on **Vercel** at **sentry.lucas-romero.com**.
+The Sentry documentation is a **Fumadocs** app (Next.js 16 + MDX + Tailwind
+v4 + Mermaid) separate from the Rust binary, living in the `docs/` git
+submodule and deployed on **Vercel** at **sentry.lucas-romero.com**.
 
 ## Why separate
 
-- The Rust binary is the product; the docs are a static/SSR site.
+- The Rust binary is the product; the docs are a Next.js site.
 - Fumadocs runs on Node.js (Next.js), not Rust.
 - Vercel offers edge CDN, preview deployments and automatic optimization
   for Next.js.
@@ -18,17 +19,39 @@ the Rust binary, deployed on **Vercel** at **sentry.lucas-romero.com**.
 ## Docs app structure
 
 ```
-sentry-docs/
-├── content/pt/              # MDX content (PT-BR)
+docs/
+├── content/
+│   ├── pt/                  # MDX content (PT-BR, primary)
+│   └── en/                  # MDX content (English, translation)
 ├── src/
-│   ├── app/[lang]/docs/     # docs routes (i18n: pt, en)
-│   ├── components/          # Mermaid, mdx components
-│   └── lib/                 # source loader, i18n config
+│   ├── app/[lang]/          # home + docs routes (i18n: pt, en)
+│   │   └── docs/[[...slug]]/
+│   ├── components/          # mermaid.tsx, mdx.tsx
+│   └── lib/                 # source.ts (loader), i18n.ts, layout.shared.tsx
 ├── source.config.ts         # Fumadocs MDX config
 ├── next.config.mjs
 ├── vercel.json
-└── package.json
+└── package.json             # scripts with bun
 ```
+
+The loader (`src/lib/source.ts`) registers `baseUrl: '/docs'` with
+directory-based i18n (`content/<lang>/`), and the i18n config sets `pt` as
+the default language — the public routes are `/pt/docs/...` and
+`/en/docs/...`.
+
+## vercel.json
+
+The
+[`vercel.json`](https://github.com/IDjinn/sentry/blob/main/docs/vercel.json)
+configures, on top of the app:
+
+- **Redirect** `/` → `/pt` (temporary — the root lands on the default
+  language).
+- **Security headers** on every route: `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: SAMEORIGIN`,
+  `Referrer-Policy: strict-origin-when-cross-origin`.
+- **Immutable cache** for `/_next/static/*`
+  (`max-age=31536000, immutable`).
 
 ## Deploy on Vercel
 
@@ -41,11 +64,13 @@ sentry-docs/
 
 ## i18n
 
-The app supports `pt` (default) and `en`. Routes are `/<lang>/docs/...`.
-The PT-BR content lives in `content/pt/`.
+The app supports `pt` (default) and `en`. Routes are `/<lang>/docs/...` and
+the content lives in `content/pt/` and `content/en/` — every page must exist
+in both languages with identical structure (same headings, tables and code
+fences; only prose and frontmatter are translated).
 
 ## Mermaid
 
 Mermaid diagrams are rendered client-side via `mermaid.tsx` (the
-`<Mermaid chart={\`...\`} />` component). The component dynamically loads
+`<Mermaid chart={...} />` component). The component dynamically loads
 `mermaid` (`await import('mermaid')`) to avoid bloating the initial bundle.

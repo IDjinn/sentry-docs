@@ -1,0 +1,83 @@
+---
+title: "Scanner distribuído MCP/SSE"
+description: "25 IPs sondam endpoints MCP/SSE em 3 dias; o pack bad_crawler pontuou 25/25 com 100/100, bloqueou e baniu"
+---
+
+# Relato de incidente — scanner distribuído de endpoints MCP/SSE (captura honeypot)
+
+> **Fonte original:**
+> [`incident-report-mcp-scanner.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mcp-scanner.md)
+> no repositório.
+
+Par de [Mozi: tentativa de RCE](./mozi-rce). Captura real de um deployment
+honeypot de produção do Sentry; os IPs dos atacantes estão parcialmente
+mascarados.
+
+## TL;DR
+
+Um scanner coordenado caçava **infraestrutura de IA** exposta — servidores
+MCP (Model Context Protocol) e endpoints SSE — a partir de **25 endereços
+IP diferentes em 3 dias**, uma sonda barata por IP para ficar abaixo dos
+rate limits por IP. O dataset curado de bad-crawlers do Sentry reconheceu o
+User-Agent da ferramenta na primeira requisição de cada sonda: **25/25 com
+score 100/100, bloqueados e banidos**. Nenhuma sonda chegou a um backend.
+
+## Resumo da campanha
+
+| Campo | Valor |
+| --- | --- |
+| Primeiro visto | 2026-10-07 21:00 UTC |
+| Último visto | 2026-10-10 22:41 UTC |
+| Eventos / IPs de origem distintos | 25 / **25** (uma sonda por IP) |
+| User-Agent | `Mozilla/5.0 (compatible; Infrawatch/1.0; +https://infrawat.ch/)` |
+| Score de risco | **100/100 — crítico** (todos os eventos) |
+| Verdict | **block** (todos os eventos) |
+| Desfecho | Os 25 IPs de origem banidos no `ip_state` |
+
+## O que eles procuravam
+
+| Path sondado | Hits |
+| --- | --- |
+| `/` (fingerprinting) | 9 |
+| `/favicon.ico` | 4 |
+| `/mcp` | 3 |
+| `/mcp/` | 3 |
+| `/sse` | 3 |
+| `/api/mcp` | 2 |
+| `/onvif/device_service` (câmeras IP) | 1 |
+
+O conjunto de paths é uma lista de compras da superfície de ataque de
+2026: **servidores MCP** (`/mcp`, `/mcp/`, `/api/mcp`) são o novo "banco de
+dados exposto" — um endpoint MCP sem autenticação entrega tools e contexto
+a qualquer um que o encontre — além de endpoints de transporte SSE e uma
+sonda legada de câmera ONVIF de quebra.
+
+Uma segunda sonda, de mais outro IP, atingiu `/mcp` com `python-httpx/0.28.1`
+como User-Agent. Mesmo desfecho: score 100, block, ban.
+
+## Como o Sentry detectou
+
+Nenhuma heurística, nenhum modelo de scoring, nenhum LLM — o **pack de
+regras `bad_crawler`** (um dataset curado de User-Agents de scanners/bots
+maliciosos) casou no primeiro byte da primeira requisição:
+
+```
+signal: rule_hit / bad_crawler — weight 100 → score 100 → critical → block
+```
+
+Este é o fast path de reputação funcionando como projetado: uma ferramenta
+conhecida como ruim identificada no estágio de regras, antes que o pipeline
+gaste qualquer coisa com heurísticas ou IA.
+
+## Por que isto demonstra eficácia
+
+- **A evasão é a pista.** Distribuir 25 sondas por 25 IPs derrota rate
+  limiting ingênuo por IP — mas não uma lista de reputação indexada pela
+  própria ferramenta.
+- **Superfície de ataque nova, defesa antiga.** Endpoints de MCP/IA mal
+  existiam quando o pack de regras foi curado; o dataset ainda assim pegou
+  a campanha, porque ferramentas de scanner reutilizam User-Agents
+  identificáveis.
+- **Contenção de custo zero.** 25 blocks, 25 bans, nenhuma ação de
+  operador, nenhuma exposição de backend — a superfície honeypot nunca
+  respondeu a uma única sonda.

@@ -1,0 +1,313 @@
+---
+title: "API — sentry-core"
+description: "Referência da API pública do sentry-core: modelo de domínio, sinais, traits de plugin, rules engine, policy, pipeline e trackers"
+---
+
+# API — `sentry-core`
+
+[`sentry-core`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/lib.rs#L1) é a crate de contratos: modelo de domínio, traits de plugin, rules engine, heurísticas e trackers. É **pura** — sem I/O, sem HTTP, sem DB — e declara `#![forbid(unsafe_code)]`. Toda crate de plugin depende apenas dela.
+
+## Modelo de domínio — módulo `event`
+
+### Event
+
+[`Event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L198) é o evento normalizado, agnóstico de protocolo, que flui por todo o pipeline. Campos comuns ficam no struct; detalhes de protocolo ficam em `protocol: ProtocolData`.
+
+```rust
+pub struct Event {
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub source: SourceKind,
+    pub transport: Transport,
+    pub client_ip: IpAddr,
+    pub geo: Option<GeoInfo>,
+    pub asn: Option<u32>,
+    /* ... bytes, duração, reputação, bot ... */
+    pub protocol: ProtocolData,
+}
+```
+
+Acessores que fazem pattern-match no payload — heurísticas e regras usam-nos para optar por lógica de um protocolo sem assumir que todo evento é HTTP:
+
+| Método | Retorna |
+| --- | --- |
+| [`http()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L274) / [`http_mut()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L282) | `Option<&HttpData>` |
+| [`tcp()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L290) | `Option<&TcpData>` |
+| [`tls()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L298) | `Option<&TlsData>` |
+| [`syslog()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L305) | `Option<&SyslogData>` |
+| [`is_http()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L314) / [`protocol_kind()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L319) | `bool` / [`ProtocolKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L85) |
+
+[`Event::new`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L248) cria com id/timestamp novos; [`Event::canonical_ip`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L243) normaliza IPv4-mapeado-em-IPv6 (`::ffff:a.b.c.d`) para IPv4 puro — o mesmo cliente vira uma única chave em blocos, storage e CLI.
+
+### ProtocolData
+
+[`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396) é o enum que torna o `Event` extensível. Adicionar um protocolo = uma variante nova + helper em `impl Event` + atualizar `protocol_kind()`.
+
+| Variante | Payload |
+| --- | --- |
+| `Http(HttpData)` | Requisição HTTP/1.x ou HTTP/2 |
+| `Tcp(TcpData)` | Stream TCP não-HTTP (captura, edge-tcp) |
+| `Udp(UdpData)` | Datagrama UDP ([`UdpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L541), decodifica DNS quando reconhece) |
+| `TlsHandshake(TlsData)` | Telemetria de ClientHello (SNI/JA3/JA4) |
+| `Syslog(SyslogData)` | Mensagem RFC 5424/3164 |
+| `Raw(RawData)` | Fallback ([`RawData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L568)) |
+
+### HttpData, UploadInfo e enums menores
+
+[`HttpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L413) carrega method/scheme/host/path/query/status/user_agent/headers/cookies/body/uploads. `body` só é populado por fontes inline e volta ao cap de captura após o pipeline. [`UploadInfo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L450) é metadado de upload (F10) — conteúdo nunca persiste; [`UploadKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L466) classifica por magic bytes (`Text`/`Image`/`Archive`/`Executable`/`Pdf`/`Unknown`).
+
+Outros tipos do módulo: [`TcpData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L484) (flags, payload reassemblado, `fingerprint` SYN, `syn_count` de rajada), [`TcpFlags`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L507), [`TcpStage`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L525), [`TlsData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L550) (sni/ja3/ja4/cipher/version/alpn), [`SyslogData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L577), [`SourceKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L19), [`Transport`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L61), [`HttpMethod`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L103), [`GeoInfo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L168) e [`ReputationInfo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L184). [`RawEvent`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L338) é o que a trait `Source` emite, antes do enriquecimento; [`into_event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L369) promove para `Event`.
+
+## Sinais e vereditos — módulo `analysis`
+
+### Signal e SignalKind
+
+[`Signal`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L77) é a unidade de detecção — o "porquê" do score:
+
+```rust
+pub struct Signal {
+    pub kind: SignalKind,
+    pub weight: u8,
+    pub detail: Option<String>,
+}
+```
+
+[`SignalKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L93) é o catálogo fechado de detecções. Pesos **default** (a config `[scorer.weights]` sobrescreve por chave, exceto `posture_advisory`, que é travado em 0):
+
+| Sinal | Peso default | Emitido por |
+| --- | --- | --- |
+| `Log4Shell` | 80 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L659) |
+| `Rce` (cmd injection) | 70 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L691) |
+| `SqlInjection` | 60 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L559) |
+| `UploadPolyglot` | 60 | [`UPLOAD_POLYGLOT_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L209) |
+| `Lfi` | 50 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L627) |
+| `KnownBadIp` | 50 | [`KNOWN_BAD_IP_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L24) |
+| `UploadExecutable` | 50 | [`UPLOAD_EXECUTABLE_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L211) |
+| `Xss` | 45 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L582) |
+| `SuspiciousLoginSuccess` | 45 | [`SUSPICIOUS_LOGIN_SUCCESS_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/behavior.rs#L34) |
+| `BadCrawler` | 40 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L749) |
+| `PathTraversal` | 40 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L605) |
+| `CredentialStuffing` | 40 | [`CREDENTIAL_STUFFING_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/behavior.rs#L30) |
+| `AuthBruteForce` | 35 | [`AUTH_BRUTE_FORCE_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/behavior.rs#L28) |
+| `ScanBehavior` | 35 | [`SCAN_BEHAVIOR_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/scan.rs#L27) |
+| `SpoofedBot` | 35 | [`SPOOFED_BOT_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L326) |
+| `SensitivePath` | 30 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L720) |
+| `TcpScanner` | 30 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L800) |
+| `UploadTypeMismatch` | 30 | [`UPLOAD_TYPE_MISMATCH_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L207) |
+| `UploadDisallowed` | 30 | [`UPLOAD_DISALLOWED_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L215) |
+| `DirectoryBruteForce` | 30 | [`DIRECTORY_BRUTE_FORCE_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/behavior.rs#L32) |
+| `RandomScan` | 25 | [`RANDOM_SCAN_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/scan.rs#L25) |
+| `UploadFlood` | 25 | [`UPLOAD_FLOOD_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L213) |
+| `ProtocolViolation` | 25 | [`PROTOCOL_VIOLATION_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L204) (schemas sobrescrevem por policy) |
+| `VpnProxy` | 20 | [`VPN_PROXY_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L26) |
+| `TlsSniMismatch` | 20 | [`TLS_SNI_MISMATCH_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L200) |
+| `UploadOversize` | 20 | [`UPLOAD_OVERSIZE_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L217) |
+| `ScanAttackCorrelation` | 20 | [`SCAN_ATTACK_CORRELATION_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/correlation.rs#L24) |
+| `TorExitNode` | 15 | [`TOR_EXIT_NODE_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L22) |
+| `MethodNotAllowed` | 10 | [RouteValidator](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L169) |
+| `SuspiciousUA` (UA vazio) | 10 | [heurística](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L771) |
+| `PromiscuousScanner` | 10 | [`PROMISCUOUS_SCANNER_WEIGHT`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/reputation.rs#L29) |
+| `UnknownRoute` | 8 | [RouteValidator](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L158) |
+| `AnomalousPayload` | 25 | `[ai] signal_weight` ([default](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1262)) |
+| `LlmMalicious` | dinâmico | score × confidence do LLM |
+| `ExternalReputation` | escalado | `abuseConfidenceScore` do provider |
+| `RuleHit` | 100/50/30 | [short-circuit de regra, por verdict](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L557) |
+| `PostureAdvisory` | **0 (travado)** | [postura web, nunca reavalia o visitante](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L222) |
+
+### Verdict, RiskLevel, AnalysisResult e Decision
+
+[`Verdict`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L231) é a ação recomendada: `Allow` / `RateLimit` / `Challenge` / `Block` / `Quarantine`. [`RiskLevel`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L18) agrupa o score 0–100 em cinco níveis fixos ([`from_score`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L37): Info 0–9, Low 10–29, Medium 30–49, High 50–74, Critical 75+).
+
+[`AnalysisResult`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L247) é a detecção (score + sinais + verdict pré-policy); [`Decision`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L329) é a resposta final após policy, com `override_reason` e `log_level` opcional. [`RuleLogLevel`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/analysis.rs#L290) controla a verbosidade de console de eventos short-circuitados (`silent|info|warn|error`).
+
+## Traits de plugin
+
+### Source
+
+Implementada por toda origem de dados ([`source.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/source.rs#L26)):
+
+```rust
+#[async_trait]
+pub trait Source: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn stream(&self) -> Result<mpsc::Receiver<RawEvent>>;
+    async fn shutdown(&self) -> Result<()> { Ok(()) }
+}
+```
+
+A origem é aberta dentro de `stream`, que devolve o **receiver** de um canal limitado; fechar o sender sinaliza fim de stream. Helpers do módulo: [`event_channel`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/source.rs#L49) (sizing padrão) e [`send_or_log`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/source.rs#L64) (push com throttle de log por fonte quando o canal enche).
+
+### Action, ActionContext e ActionDispatch
+
+Implementada por toda resposta ([`action.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/action.rs#L74)):
+
+```rust
+#[async_trait]
+pub trait Action: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn execute(&self, evt: &Event, decision: &Decision) -> Result<()>;
+    async fn execute_with_context(&self, evt: &Event, decision: &Decision, ctx: &ActionContext) -> Result<()>;
+    fn applies_to(&self, decision: &Decision) -> bool;
+    fn dispatch(&self) -> ActionDispatch;
+}
+```
+
+Implementações devem ser idempotentes (replay pós-restart é no-op, não erro). [`ActionContext`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/action.rs#L60) carrega o `incident_id` para alertas bidirecionais (F4.5). [`ActionDispatch`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/action.rs#L24) decide onde a action roda: `Inline` (contenção local, hot path) ou `Deferred` (default; I/O de rede vai para workers postergados).
+
+### ChallengeProvider
+
+Abstração provider-agnostic de edge ([`challenge.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L95)) — espelha o `LlmProvider`:
+
+```rust
+#[async_trait]
+pub trait ChallengeProvider: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn apply(&self, ip: IpAddr, verdict: Verdict, opts: &EdgeOptions) -> Result<()>;
+}
+```
+
+[`ChallengeAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L114) é a única `Action` que os providers de edge exigem: ela filtra os vereditos `Block`/`Challenge`/`RateLimit` (pula `Allow`/`Quarantine`) e delega ao provider. [`EdgeMode`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L31) é o sabor (`block`/`js_challenge`/`managed_challenge`/`rate_limit`) e [`EdgeOptions`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs#L71) carrega TTL + modo preferido. Novo provider de edge (AWS WAF, Fastly…) = implementar a trait + um braço em `daemon::build_challenge_action`.
+
+## Providers de IA (crate `sentry-ai`)
+
+### LlmProvider
+
+Contrato de classificação por LLM ([`llm.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L95)):
+
+```rust
+#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn model_id(&self) -> &str;
+    async fn classify(&self, req: ClassifyRequest) -> anyhow::Result<ClassifyResponse>;
+    async fn explain(&self, req: ExplainRequest) -> anyhow::Result<String>;
+}
+```
+
+Adapters embarcados: [`OpenRouterProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/openrouter.rs#L35) (default, `SENTRY_LLM_KEY`), [`OllamaProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/ollama.rs#L34) (local, sem chave) e [`MockLlmProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm/mock.rs#L13). [`ClassifyResponse`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/llm.rs#L56) traz verdict, score, confidence e uso de tokens.
+
+### IpLookupProvider
+
+Lookup externo de reputação por IP (F7.5, [`lookup.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/lookup.rs#L30)):
+
+```rust
+#[async_trait]
+pub trait IpLookupProvider: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn check(&self, ip: IpAddr) -> Result<IpLookupResult, String>;
+}
+```
+
+[`AbuseIpDbLookup`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/lookup.rs#L40) implementa `GET /api/v2/check`; o `score` retornado escala o peso do sinal `ExternalReputation`. O fork assíncrono do daemon só consulta a "banda cinza" (score acima do trigger, verdict ≠ Block), com cache e quota.
+
+### ThreatModel
+
+O modelo local clássico fica atrás de [`ThreatModel`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/threat.rs#L18) — implementado por [`OnnxThreatModel`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/src/onnx_model.rs#L28) quando a feature `onnx` está ligada. Detalhes de treino/export em [IA](/pt/ai).
+
+## Rules engine — módulo `rules`
+
+### Rule, RuleSet e SharedRuleSet
+
+```rust
+pub struct Rule {
+    pub id: RuleId,
+    pub priority: i32,      // menor = avaliado antes
+    pub enabled: bool,
+    pub match_: RuleMatch,
+    pub action: RuleAction,
+    pub ttl: Option<Duration>,
+    pub source: RuleSource,
+    /* tags, log_level, created_at */
+}
+```
+
+[`Rule`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L155) é avaliada na fast-path, antes de heurísticas e IA. [`RuleSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L188) indexa regras por IP/ASN/país para lookup rápido; [`SharedRuleSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L198) é o handle `Arc<RwLock<>>` que o hot-reload troca a quente ([`shared()`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L201)).
+
+### RuleAction e RuleSource
+
+[`RuleAction`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L126): `Allow` (bypass total) > `Block`/`Challenge`/`RateLimit` (short-circuit) > `Log`/`Tag` (anota e continua). [`RuleSource`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L108) registra a origem (`config`/`db`/`cloudflare_sync`/`feed`/`auto_learned`/`default_pack`).
+
+### RuleMatch
+
+[`RuleMatch`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L358) é a condição declarativa, combinável com `All`/`Any`/`Not`: `Ip(cidr)`, `Asn`, `Country`, `Path{op, pattern}`, `Method`, `Header{name, op}`, `UserAgent`, `Query`, `Body`, `UploadFilename`, `Protocol`, `TlsFingerprint{ja3, ja4}`, `TlsSni`, `Ja3In(set)`, `Reputation(tier)`, `BotVerified`, `Status`, `Rate{count, per_secs, scope}`, `Time`.
+
+### DSL
+
+O texto do `match = "..."` no TOML é compilado por [`dsl::parse`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules/dsl.rs#L36) (recursive-descent, `AND`/`OR`/`NOT`/parênteses) em um `RuleMatch`. Erro de digitação falha em tempo de carga, não em runtime. [`rules_from_config`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L210) compila cada `[[rules.custom]]` independentemente — uma expressão inválida pula só aquela regra. [`ReputationTier`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L488) (`malicious`/`tor`/`vpn_proxy`/`promiscuous`/`authorized`) alimenta `Reputation(tier)`.
+
+## Política — módulo `policy`
+
+### VerdictPolicy
+
+[`VerdictPolicy`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/policy.rs#L17) é o mapeamento configurável detecção→ação. O default preserva o histórico (Info/Low→Allow, Medium→RateLimit, High→Challenge, Critical→Block); cada nível é remapeável no TOML e `[[policy.override]]` força verdict por DSL — o primeiro override que casa vence e popula `Decision.override_reason`.
+
+```rust
+pub fn from_config(cfg: &PolicyConfig) -> Result<Self>;
+pub fn decide(&self, level: RiskLevel, evt: &Event) -> (Verdict, Option<String>);
+```
+
+## Pipeline — módulo `pipeline`
+
+### Pipeline
+
+[`Pipeline`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L304) orquestra regras → heurísticas → rotas → scorer → policy → escalada. Construção por builders encadeados:
+
+| Método | Liga |
+| --- | --- |
+| [`with_config`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L362) | ruleset compartilhado + rotas + scorer + policy |
+| [`configure_uploads`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L398) | inspeção de corpo/uploads (F10) |
+| [`with_trust`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L414) | never-ban/blacklist/shadow (F7.2) |
+| [`with_rate_limiter`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L420) | backend p/ condições `Rate` |
+| [`with_offender`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L426) | escalada de reincidentes |
+| [`with_scan_tracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L437) / [`with_behavior_tracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L444) / [`with_correlation_tracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L450) | detectores comportamentais |
+| [`with_bot_verifier`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L458) | verificação rDNS de bots (F7.10) |
+
+Métodos de execução e hot-reload: [`process`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L465) (síncrono, retorna [`ProcessedEvent`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L334)), [`rescore_from`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L1005) (re-integra sinais de forks AI/LLM/lookup — **só eleva**, nunca rebaixa), [`observe_response`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L737) (fila de sinais de resposta por-IP, F3.9.1), [`swap_rules`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L944) / [`swap_routes`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L950), [`prune_pending`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L770).
+
+### RouteValidator e RouteDef
+
+[`RouteValidator`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L94) valida rotas conhecidas: path fora da lista → `UnknownRoute`; método não suportado → `MethodNotAllowed`. [`RouteDef`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L36) aceita templates (`/users/{id}`, trailing `/*`); [`RouteValidator::merge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/pipeline.rs#L120) une config ∪ DB (dedupe por path, config vence).
+
+## Trackers de estado
+
+Todos são por-IP com janelas deslizantes e história limitada; o daemon faz prune periódico.
+
+| Tracker | Arquivo | O que detecta |
+| --- | --- | --- |
+| [`OffenderTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/offender.rs#L36) | `offender.rs` | Reincidentes: strikes por janela; [`record_and_escalate`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/offender.rs#L93) só sobe o verdict na escada RateLimit→Challenge→Block |
+| [`ScanTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/scan.rs#L37) | `scan.rs` | 4xx em rajada: ≥N paths distintos → `RandomScan`; ≥N 4xx → `ScanBehavior` |
+| [`BehaviorTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/behavior.rs#L100) | `behavior.rs` | Força bruta em login, credential stuffing (UAs distintos), wordlist 404, sucesso suspeito pós-falhas |
+| [`CorrelationTracker`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/correlation.rs#L60) | `correlation.rs` | Scan de **outro** IP no mesmo /24, /64 ou ASN pouco antes do ataque → `ScanAttackCorrelation` |
+| [`BotVerifier`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L206) | `botverify.rs` | Cache rDNS de crawlers (`Verified`/`Spoofed`/`Unknown`); DNS injetado via [`BotDnsResolver`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L168), fluxo puro em [`verify_with`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L184) |
+| [`BlockTable`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/blocks.rs#L20) | `blocks.rs` | Tabela compartilhada de IPs bloqueados com TTL opcional; fast-path da edge nega antes do pipeline ([`is_blocked`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/blocks.rs#L49), [`seed`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/blocks.rs#L64), [`reload`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/blocks.rs#L76)) |
+| [`TrustSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/trust.rs#L96) / [`SharedTrustSet`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/trust.rs#L191) | `trust.rs` | Proxies confiáveis, never-ban, blacklist e shadow-list do `[real_ip]`; ranges Cloudflare embutidos ([`cloudflare_ranges`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/trust.rs#L81)) |
+
+## Config — módulo `config`
+
+[`SentryConfig`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L14) é o schema tipado do `sentry.toml` (serde; a carga com figment + overlay `SENTRY_` vive no CLI). Cada seção tem seu struct (`CoreConfig`, `EdgeConfig`, `UploadsConfig`, `PolicyConfig`, …), todos reexportados na raiz da crate. A referência completa de chaves e defaults vive na seção [Configuração](/pt/config) — aqui fica só o contrato: o tipo de action é o enum [`ActionKind`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L2103), não string, então erro de digitação falha na carga.
+
+## Heurísticas — módulo `heuristics`
+
+### Heuristic e HeuristicEngine
+
+```rust
+pub trait Heuristic: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn gate_bit(&self) -> Option<u8> { None }
+    fn analyze(&self, evt: &Event, text: &DecodedHttp<'_>) -> Vec<Signal>;
+}
+```
+
+[`Heuristic`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L22) é um detector de regex; [`HeuristicEngine`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L355) roda todos ([`analyze`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L410)). Performance (F5): um autômato Aho-Corasick de literais-gatilho ([`gate`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L99)) antecipa as regex — tráfego limpo custa uma passada SIMD. As famílias embarcadas: `SqlInjection`, `Xss`, `PathTraversal`, `Lfi`, `Log4Shell`, `CmdInjection`, `SensitivePath`, `BadCrawler`, `EmptyUserAgent`, `TcpScanner` + as de upload (F10, com `gate_bit() = None` porque operam sobre corpo, não texto de path).
+
+### DecodedHttp
+
+[`DecodedHttp`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L44) carrega o path e a query **URL-decodificados** (`%27`→`'`, `+`/`%20`→espaço) computados uma vez por evento, mais multipart/urlecoded parseados. Ao escrever nova heurística, analise `text.path`/`text.query` — nunca `http.path` cru, senão payloads encodados fazem bypass. (O decode acontece no helper interno [`http_text`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L506).)
+
+### reload_dataset_lists
+
+```rust
+pub fn reload_dataset_lists(user_agents: &[String], paths: &[String]);
+```
+
+[`reload_dataset_lists`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/heuristics.rs#L296) mescla literais de datasets DB-backed (`user_agent`/`path`) nos gates do prefilter via `ArcSwap` — hot-reload sem restart (F7.7).

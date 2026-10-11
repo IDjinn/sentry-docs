@@ -5,12 +5,13 @@ description: "Deploy do site de docs na Vercel"
 
 # Deploy da Documentação na Vercel
 
-A documentação do Sentry é um app **Fumadocs** (Next.js + MDX) separado do
-binário Rust, deployado na **Vercel** em **sentry.lucas-romero.com**.
+A documentação do Sentry é um app **Fumadocs** (Next.js 16 + MDX + Tailwind v4
++ Mermaid) separado do binário Rust, morando no submodule git `docs/` e
+deployado na **Vercel** em **sentry.lucas-romero.com**.
 
 ## Por que separado
 
-- O binário Rust é o produto; a docs é um site estático/SSR.
+- O binário Rust é o produto; a docs é um site Next.js.
 - Fumadocs roda em Node.js (Next.js), não em Rust.
 - A Vercel oferece edge CDN, preview deployments e otimização automática
   para Next.js.
@@ -18,17 +19,36 @@ binário Rust, deployado na **Vercel** em **sentry.lucas-romero.com**.
 ## Estrutura do app de docs
 
 ```
-sentry-docs/
-├── content/pt/              # conteúdo MDX (PT-BR)
+docs/
+├── content/
+│   ├── pt/                  # conteúdo MDX (PT-BR, primário)
+│   └── en/                  # conteúdo MDX (inglês, tradução)
 ├── src/
-│   ├── app/[lang]/docs/     # rotas de docs (i18n: pt, en)
-│   ├── components/          # Mermaid, mdx components
-│   └── lib/                 # source loader, i18n config
+│   ├── app/[lang]/          # home + rotas de docs (i18n: pt, en)
+│   │   └── docs/[[...slug]]/
+│   ├── components/          # mermaid.tsx, mdx.tsx
+│   └── lib/                 # source.ts (loader), i18n.ts, layout.shared.tsx
 ├── source.config.ts         # config Fumadocs MDX
 ├── next.config.mjs
 ├── vercel.json
-└── package.json
+└── package.json             # scripts com bun
 ```
+
+O loader (`src/lib/source.ts`) registra `baseUrl: '/docs'` com i18n de
+directório (`content/<lang>/`), e o i18n define `pt` como linguagem default —
+as rotas públicas são `/pt/docs/...` e `/en/docs/...`.
+
+## vercel.json
+
+O [`vercel.json`](https://github.com/IDjinn/sentry/blob/main/docs/vercel.json)
+configura, além do app:
+
+- **Redirect** `/` → `/pt` (temporário — raiz cai na linguagem default).
+- **Security headers** em todas as rotas: `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: SAMEORIGIN`,
+  `Referrer-Policy: strict-origin-when-cross-origin`.
+- **Cache imutável** para `/_next/static/*`
+  (`max-age=31536000, immutable`).
 
 ## Deploy na Vercel
 
@@ -41,11 +61,13 @@ sentry-docs/
 
 ## i18n
 
-O app suporta `pt` (default) e `en`. As rotas são `/<lang>/docs/...`.
-O conteúdo PT-BR vive em `content/pt/`.
+O app suporta `pt` (default) e `en`. As rotas são `/<lang>/docs/...` e o
+conteúdo vive em `content/pt/` e `content/en/` — cada página precisa existir
+nas duas linguagens com a mesma estrutura (títulos, tabelas e code fences
+idênticos; só a prosa e o frontmatter são traduzidos).
 
 ## Mermaid
 
 Os diagramas Mermaid são renderizados client-side via `mermaid.tsx`
-(component `<Mermaid chart={\`...\`} />`). O componente carrega `mermaid`
+(componente `<Mermaid chart={...} />`). O componente carrega `mermaid`
 dinamicamente (`await import('mermaid')`) para não inflar o bundle inicial.

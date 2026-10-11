@@ -1,109 +1,123 @@
 ---
 title: "High-Level Architecture"
-description: "Sentry's pipeline, layers and design principles"
+description: "Sentry layers, crates and design principles"
 ---
 
 # High-Level Architecture
 
-Sentry is organized into three plugin layers (Sources, Core, Actions) on top
-of a persistence layer. Every plugin implements a common trait, allowing new
-sources and actions to be added without recompiling the core.
+Sentry is a Cargo workspace organized in **three plugin layers** (Sources,
+Core, Actions) on top of a Postgres persistence layer. Sources produce
+normalized events; the core analyzes and decides; actions execute the
+decision. Every plugin implements a common trait, so new sources and
+actions never require changing the core.
 
-<Mermaid chart={`
+```mermaid
 flowchart TB
-    subgraph Sources[Camada de Fontes — Plugins]
-        N1[Nginx Access Log]
-        N2[HTTP Proxy Middleware]
-        N3[TCP Capture]
-        N4[Syslog / Journald]
-        N5[Cloudflare Logs]
+    subgraph Sources["Source Layer — plugins"]
+        N1["nginx access log (tail)"]
+        N2["Syslog RFC 5424/3164"]
+        N3["TCP capture (pcap)"]
+        N4["Cloudflare Logs API"]
+        N5["Inline edge (proxy/TLS/TCP)"]
     end
 
-    subgraph Core[Core Sentry]
-        ING[Ingestor<br/>Normaliza p/ Event]
-        PIPE[Pipeline de Análise]
-        AI[Motor de IA]
-        HEUR[Heurísticas/Regras]
-        ROUTE[Validador de Rotas]
-        RISK[Score de Risco]
-        DECID[Decisor / Política]
+    subgraph Core["sentry-core — contracts and analysis"]
+        ING["Ingest + LRU dedupe"]
+        RULES["Rules engine (packs)"]
+        HEUR["Heuristics (Aho-Corasick prefilter)"]
+        TRACK["Trackers (scan, behavior, correlation)"]
+        AI["AI (ONNX) / LLM forks"]
+        RISK["Scorer + policy + escalation"]
     end
 
-    subgraph Actions[Camada de Ações — Plugins]
-        A1[Block IP]
-        A2[Rate Limit]
-        A3[Cloudflare Challenge]
-        A4[Alerta Webhook]
-        A5[Log/Store]
+    subgraph Actions["Action Layer — plugins"]
+        A1["Blocklist / kernel firewall"]
+        A2["Cloudflare (block/challenge)"]
+        A3["Webhook / community report"]
+        A4["nginx includes / OPNsense"]
     end
 
-    subgraph Storage[Persistência]
-        DB[(SQLite / Postgres)]
-        BL[(Blocklist state)]
+    subgraph Storage["Persistence"]
+        DB[("Postgres")]
     end
 
     Sources --> ING
-    ING --> PIPE
-    PIPE --> HEUR
-    PIPE --> AI
-    PIPE --> ROUTE
-    HEUR --> RISK
-    AI --> RISK
-    ROUTE --> RISK
-    RISK --> DECID
-    DECID --> Actions
-    Actions --> Storage
-    DECID --> Storage
-`} />
+    ING --> RULES --> HEUR --> TRACK --> RISK
+    AI -.->|"rescore (only raises)"| RISK
+    RISK --> Actions
+    Actions --> DB
+    RISK -->|"batched persistence"| DB
+    DB -.->|"LISTEN/NOTIFY hot-reload"| Core
+```
 
 ## Design principles
 
-1. **`Source` trait**: every plugin implements `fn stream_events(&self) -> impl Stream<Item = RawEvent>`. Adding nginx = implementing the trait.
-2. **`Action` trait**: `fn execute(&self, decision: &Decision) -> Result<()>`. Block, Challenge, Alert, etc.
-3. **Normalized Event**: a single `struct Event` regardless of source. The core never knows whether it came from nginx or TCP.
-4. **Asynchronous pipeline**: `tokio` + channels. Each stage is an actor/fan-out.
-5. **Declarative configuration**: `sentry.toml` defines active sources, active actions, thresholds.
+1. **Event modular via `ProtocolData`**: a single
+   [`Event`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs)
+   independent of origin. Protocol specifics live in the
+   [`ProtocolData`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/event.rs#L396)
+   enum — never as loose top-level fields.
+2. **Plugins depend only on the core**: every `sentry-source-*` /
+   `sentry-action-*` crate implements the
+   [`Source`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/source.rs)
+   / [`Action`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/action.rs)
+   traits and depends only on `sentry-core`, never on another plugin.
+3. **Pure core**: `sentry-core` does no heavy I/O (no HTTP, no DB). It
+   defines contracts — rules, heuristics, scorer, trackers, pipeline.
+4. **Provider-agnostic edge actions**: the
+   [`ChallengeProvider`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/challenge.rs)
+   trait mirrors `LlmProvider`; the verdict filter lives in the core, the
+   provider only implements `apply`. Adding AWS WAF/Fastly changes no
+   rules and no pipeline.
+5. **Heavy features are optional**: ONNX (`onnx`), TLS (`edge-tls`), zstd
+   (`edge-zstd`), pcap and redis sit behind feature flags that are off by
+   default.
+6. **Declarative configuration**: `sentry.toml` + env overlay (`SENTRY_*`)
+   via figment, validated at load time (typos in `type = "..."` fail at
+   load).
 
-## Tech stack
+## Crate map (workspace)
 
-| Layer             | Crate / Technology                                  | Rationale                                              |
-|-------------------|-----------------------------------------------------|--------------------------------------------------------|
-| Async runtime     | `tokio`                                             | De facto standard, cross-platform                      |
-| CLI               | `clap` (derive) + `ratatui` for live TUI           | Ergonomics, subcommands, live panel                    |
-| Config            | `serde` + `toml` + `figment` (env+file merge)      | Env-var override in prod                               |
-| Logs/Tracing      | `tracing` + `tracing-subscriber`                   | Structured logging, per-request spans                  |
-| nginx parser      | `nom` or `regex` + `serde`                         | Custom access_log line format                          |
-| HTTP client       | `reqwest` (rustls)                                 | Cloudflare API, webhooks, geolookup                    |
-| Local ML/AI       | `ort` (ONNX Runtime) + `candle` fallback           | Local inference without external API dependency        |
-| LLM (optional)    | `LlmProvider` trait + adapters: **OpenRouter** (routes to any model), `async-openai`, `ollama-rs` | Complex payload analysis on demand, provider-agnostic |
-| Storage           | `sqlx` with **Postgres** default (sqlx migrations), optional SQLite via feature flag | Same schema, switch via feature flag; Postgres supports HA and multiple nodes from day one |
-| Geolookup         | `maxminddb` (local DB)                              | No external call per event                             |
-| IPC/Embeddable    | `core` as a lib crate (`sentry-core`)              | Future dashboard consumes the same lib                  |
-| Serialization     | `serde` + `serde_json`                             | Events, export, future API                             |
-| Errors            | `thiserror` (lib) + `color-eyre` (bin)             | Ergonomics + readable backtraces                       |
-| Tests             | `proptest` + `insta` (snapshots) + `wiremock`      | Malicious payloads, log fixtures                       |
-| Build/Release     | `cargo-dist` or `cross`                            | Multi-OS binaries                                      |
+| Crate | Purpose |
+| --- | --- |
+| [`sentry-core`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/) | Pure: `Event`/`ProtocolData`, traits, rules engine + DSL, heuristics, scorer, trackers (scan/behavior/correlation/offender), pipeline, config, posture, botverify, BlockTable |
+| [`sentry-storage`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-storage/) | Postgres via sqlx: 5 repos (events/incidents/ip_state/rules/routes), migrations, `LISTEN/NOTIFY` |
+| [`sentry-ai`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-ai/) | `ThreatModel` trait (ONNX via ort) + `LlmProvider` trait (OpenRouter, Ollama, …) + external IP lookup |
+| [`sentry-geo`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-geo/) | Geo/ASN enrichment with maxminddb (graceful no-op without the databases) |
+| [`sentry-reputation`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-reputation/) | Reputation feeds (Tor/Spamhaus/FireHOL) with an SSRF-guarded fetcher |
+| [`sentry-protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-protocol/) | Protocol description/validation DSL (F9): schema → compiler → VM (optional `simd` feature) |
+| [`sentry-edge`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-edge/) | Inline edge: axum reverse proxy, edge-tcp, TLS 443 with JA3/JA4 telemetry (F8), PoW challenge, compression, error pages |
+| [`sentry-source-nginx`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-nginx/) | Source plugin: access.log tail with real-IP resolution (§8.1) and rotation |
+| [`sentry-source-syslog`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-syslog/) | Source plugin: RFC 5424/3164 syslog receiver (UDP/TCP, RFC 6587 framing) |
+| [`sentry-source-cloudflare`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-cloudflare/) | Source plugin: CF Logs API polling (NDJSON), dedupe by RayID |
+| [`sentry-source-tcp`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-source-tcp/) | Source plugin: TCP capture behind the `pcap` feature; MuonFP/p0f-style SYN fingerprinting lives in the core (`tcpfp.rs`) |
+| [`sentry-action-cloudflare`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-cloudflare/) | Edge action: block/challenge via the CF API (access rules + /64 IP Lists), reconcile and reaper |
+| [`sentry-action-webhook`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-webhook/) | Action: Discord/Slack/etc alerts with HMAC signature |
+| [`sentry-action-blocklist`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-blocklist/) | Action: in-memory local blocklist (mirrors into the shared `BlockTable`) |
+| [`sentry-action-firewall`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-firewall/) | Action: kernel bans nftables/ipset/firewalld synced from `ip_state` (Linux-only) |
+| [`sentry-action-opnsense`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-opnsense/) | Action: OPNsense (alias_util REST) and pfSense (`pfctl`) bans |
+| [`sentry-action-nginx`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-nginx/) | Action: deny/challenge includes for nginx + reload with `nginx -t` |
+| [`sentry-action-report`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-action-report/) | Action: community reporting to AbuseIPDB/ReportedIP with dedupe and circuit breaker |
+| [`sentry-cli`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/) | Binary: daemon + wiring, HTTP server (`serve`), ratatui TUI, auth/RBAC, SIEM export, service mode, CLI commands |
 
-## Crate structure (workspace)
+## Workspace conventions
 
-```
-sentry/
-├── Cargo.toml                    # workspace
-├── crates/
-│   ├── sentry-core/              # lib: Event, traits, pipeline, scoring
-│   ├── sentry-source-nginx/      # plugin Source: nginx log tail
-│   ├── sentry-source-http/       # plugin Source: proxy middleware (future)
-│   ├── sentry-source-tcp/        # plugin Source: pcap (future)
-│   ├── sentry-source-cloudflare/ # plugin Source: pull CF logs
-│   ├── sentry-ai/                # ONNX + LLM provider trait
-│   ├── sentry-action-cloudflare/ # plugin Action
-│   ├── sentry-action-webhook/    # plugin Action
-│   ├── sentry-action-blocklist/  # plugin Action
-│   ├── sentry-storage/           # sqlx SQLite/Postgres
-│   ├── sentry-geo/               # maxminddb wrapper
-│   └── sentry-cli/               # binary: clap + ratatui + entrypoint
-├── models/                       # versioned ONNX models
-├── config/sentry.example.toml
-├── tests/                        # integration tests
-└── docs/
-```
+- Shared dependencies live in `[workspace.dependencies]` in the root
+  `Cargo.toml`; each crate references them via `{ workspace = true }`.
+- `sentry-core` is **pure** (`#![forbid(unsafe_code)]` in every lib) — no
+  network or database I/O; the daemon (`sentry-cli`) does the wiring.
+- Adding a new protocol: new `ProtocolData` variant + helper on
+  `impl Event` + `protocol_kind()` update. Details on the
+  [Data Model](/en/architecture/data-model) page.
+- Adding a new edge provider (AWS WAF, Fastly…): new crate implementing
+  `ChallengeProvider` + an arm in the daemon's `build_challenge_action`
+  match — no `ActionKind`, rule or pipeline changes.
+
+## Next steps
+
+- [Data Model](/en/architecture/data-model) — `Event`, `ProtocolData`, `UploadInfo`
+- [Request Flow](/en/architecture/request-flow) — the pipeline in order, for both ingestion modes
+- [Risk Levels](/en/architecture/risk-levels) — signal weights, verdicts, escalation
+- [Daemon Lifecycle](/en/architecture/daemon-lifecycle) — startup, background tasks, hot-reload
+- [Inline Edge](/en/architecture/edge-inline) — proxy, TLS, challenge, uploads, compression
+- [Performance](/en/architecture/performance) — benchmark numbers, two-lane hot path, overload

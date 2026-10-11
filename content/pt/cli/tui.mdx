@@ -1,67 +1,110 @@
 ---
 title: "TUI Interativa"
-description: "Terminal UI fullscreen com ratatui"
+description: "Live tail fullscreen com ratatui: 3 zonas, filtros, popups e ações por IP"
 ---
 
 # TUI Interativa
 
-A CLI tem **dois modos de `tail`**:
+O `sentry tail` tem **dois modos** (definidos em
+[`cli.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cli.rs),
+despachados em
+[`cmd.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/cmd.rs)):
 
-- `sentry tail` (ou `sentry tail --tui`) → abre **TUI interativa
-  fullscreen** com `ratatui` + `crossterm`. Modo default quando o terminal
-  é TTY.
-- `sentry tail --stream` → modo **não-interativo**, uma linha por evento
-  (JSON ou texto colorido). Ideal para pipe (`| jq`, `| grep`), logs
-  estruturados ou redirecionamento. Ativado automaticamente quando
-  stdin/stdout não é TTY (detecção via `std::io::IsTerminal`).
+- `sentry tail` (ou `sentry tail --tui`) → **TUI interativa fullscreen** com
+  `ratatui` + `crossterm`. Modo default quando o stdout é um TTY.
+- `sentry tail --stream` → modo **não-interativo**, uma linha por evento.
+  Ativado automaticamente quando o stdout não é TTY (detecção via
+  `std::io::IsTerminal`).
+
+Os dois modos leem eventos do Postgres — exigem config com
+`storage.postgres.url`.
 
 ## Layout fullscreen — 3 zonas
 
+A TUI consulta os últimos 500 eventos a cada 200 ms. O layout tem 3 zonas
+(maquete ilustrativa):
+
 ```
-┌──────────────────────── Sentry — live ────────────────────────┐
-│ req/s 412 ▁▂▃▅▇▆▄▂   Info 9.8k  Low 142  Med 31  High 7  Crit 1│  ← header/sparkline
-├────────────────────────────────────────────────────────────────┤
-│ CRIT 1.2.3.4   POST /api/login   SQLi:' OR 1=1--               │  ← stream colorido
-│ HIGH 5.6.7.8   GET  /.env         UnknownRoute+sensitive        │     (scroll, filtro)
-│ MED  9.0.1.2   GET  /wp-admin     ScanBehavior (12x404/60s)     │
-│ ...                                                            │
-├────────────────────────────────────────────────────────────────┤
-│ Top IPs suspeitos        │ Top paths atacados   │ ASN/Geo      │  ← rodapé agregado
-│ 1.2.3.4    18  CRIT      │ /admin     22        │ AS1234  41%  │
-│ 5.6.7.8    11  HIGH      │ /.env      9         │ Tor     3%   │
-└────────────────────────────────────────────────────────────────┘
- [f]iltrar [b]loquear [c]hallenge [i]nfo IP [r]otas [q]sair
+┌───────────────────────── Sentry — live ─────────────────────────┐
+│ ▁▂▃▅▇▆▄▂▃▅            req/s 412   Info 9.8k  Low 142  Med 31    │
+│ [PAUSED] +12 novos  filtro:"/admin"  levels:High,Critical  db: ok│
+├──────────────────────────── Eventos ────────────────────────────┤
+│ 14:02:11 critical  78  203.0.113.7  [nginx]  POST   /api/login  │
+│         403  SQLi (+60) ' OR 1=1--                              │
+│ 14:02:09 high      35  198.51.100.4 [nginx]  GET    /.env   404 │
+│         Sensitive (+25)                                         │
+├────────────────────── Agregados — janela ───────────────────────┤
+│ Top IPs          │ Top paths              │ ASN/Geo              │
+│ 203.0.113.7 18 CRIT │ /admin        22    │ AS64512   41%        │
+│ 198.51.100.4 11 HIGH│ /.env          9    │ Tor        3%        │
+└─────────────────────────────────────────────────────────────────┘
+ [f]iltrar · [Enter] detalhe · [b] bloquear · [u] unblock · [c]
+ challenge · [i] info IP · [r] rotas · [Space] pausa · [q] sair
 ```
+
+- **Header** — sparkline de req/s, contadores por nível
+  (`Info`/`Low`/`Med`/`High`/`Crit`) e uma linha de estado: `[PAUSED]` com
+  backlog, filtro textual ativo, filtro de levels e saúde da conexão
+  (`db: ok` / `db: ERRO`).
+- **Eventos** — stream colorido por nível (hora, level, score, IP, source,
+  método, path, status e resumo de sinais), com cursor de seleção.
+- **Rodapé** — agregados da janela visível: Top IPs (com pior nível), Top
+  paths e ASN/Geo (com % de Tor). Responsivo: 3 colunas com largura ≥ 100,
+  2 colunas ≥ 60, 1 coluna abaixo disso.
 
 ## Atalhos
 
-| Tecla   | Ação                                            |
-|---------|-------------------------------------------------|
-| `j`/`↓` | Navegar para baixo                              |
-| `k`/`↑` | Navegar para cima                                |
-| `g`     | Ir para o topo                                   |
-| `G`     | Ir para o fim                                    |
-| `Space` | Pausa/congela o stream (bufferizado)             |
-| `Enter` | Abre detalhe do evento (headers, payload, signals, verdict IA) |
-| `b`     | Bloqueia IP selecionado (pede confirmação)       |
-| `c`     | Dispara challenge Cloudflare                     |
-| `i`     | Mostra histórico completo do IP                  |
-| `f`     | Abre filtro (por level/IP/path/ASN)              |
-| `r`     | Abre painel de rotas                             |
-| `/`     | Busca textual                                    |
-| `q`/`Esc`| Sair                                            |
+| Tecla | Ação |
+| --- | --- |
+| `j`/`↓`, `k`/`↑` | Navegar na lista (`PageDown`/`PageUp` pulam 10). |
+| `g`/`Home`, `G`/`End` | Ir para o topo / para o fim. |
+| `f` ou `/` | Abre o input de filtro textual (Enter aplica, vazio limpa, Esc cancela). Substring case-insensitive sobre level, IP, source, verdict, path, ASN, país e sinais do evento. |
+| `Space` | Pausa/retoma o stream; enquanto pausado, o header mostra `[PAUSED] +N novos`. |
+| `Enter` | Popup de detalhe do evento selecionado. |
+| `b` | Bloqueia o IP do evento selecionado (confirmação `y`/`n`; grava em `ip_state` + NOTIFY `sentry_blocks_changed`). |
+| `u` | Desbloqueia o IP (remove bloqueio e strikes). |
+| `c` | Managed challenge no Cloudflare para o IP (TTL 24h). |
+| `i` | Popup com info do IP: bloqueado, strikes, incidente aberto e últimos 15 eventos. |
+| `r` | Popup com as rotas conhecidas (até 100). |
+| `q`/`Esc` | Sair (ou fecha o popup aberto). |
 
-## Render responsivo
+Ações `b`/`c` respeitam o guard never-ban de `[real_ip]`: IP trusted recebe
+"ação ignorada" em vez de ser banido.
 
-- Redimensionamento de terminal suportado.
-- Alterna colunas do rodapé conforme largura.
+## Detalhe do evento
+
+No popup aberto com `Enter`: hora, cliente `ip:porta` → porta local, geo
+(ASN/país), request (método/path → status), risco (level/score/verdict/
+source), a lista de sinais com peso e detail, o JSON do protocolo
+(truncado em 60 linhas) e o raw do log. Scroll com `j`/`k` ou
+`PageUp`/`PageDown`; qualquer outra tecla fecha.
+
+## Modo stream
+
+`sentry tail --stream` imprime uma linha por evento (texto simples ou
+colorido quando o stdout é TTY), com os últimos 20 eventos no arranque e
+poll de 1 s depois. Com `--json`, emite JSONL com key-set estável:
+`timestamp`, `source`, `ip`, `server_port`, `asn`, `country`, `level`,
+`score`, `verdict`, `method`, `path`, `status`, `signals`. Ideal para pipe
+(`| jq`, `| grep`) e coleta estruturada. Implementação em
+[`tui/stream.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/tui/stream.rs).
 
 ## Themes
 
-`--theme dark|light|mono` (acessibilidade / terminais sem cor).
+`--theme` seleciona o tema (parse em
+[`tui/theme.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/tui/theme.rs)):
+
+- `dark` (default) — texto claro para terminais escuros.
+- `light` — texto escuro para terminais claros.
+- `mono` — sem cor: negrito/dim apenas (acessibilidade, terminais sem cor).
 
 ## Implementação
 
-TUI standalone em `sentry-cli/src/tui.rs` (~250 linhas), lê eventos
-recentes do Postgres, scrollável, com atalhos `j`/`k`/`Space`/`g`/`G`/`q`/
-`Esc`.
+Módulo [`tui/`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/tui/mod.rs):
+
+| Arquivo | Responsabilidade |
+| --- | --- |
+| `mod.rs` | App, polling do Postgres, popups (detalhe/filtro/confirm), ações por IP. |
+| `agg.rs` | Filtros de level (`--only`) e textual, sparkline, Top IPs/paths, ASN/Geo, labels de sinais. |
+| `stream.rs` | Modo `--stream` (texto e JSONL). |
+| `theme.rs` | Temas `dark`/`light`/`mono`. |

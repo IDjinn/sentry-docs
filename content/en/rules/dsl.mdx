@@ -1,50 +1,159 @@
 ---
 title: "Match DSL"
-description: "Declarative mini-language for match expressions"
+description: "Full reference for the declarative match expression language"
 ---
 
 # Match DSL
 
-The `match` DSL is a **declarative mini-language** for config and CLI
-(`ip=`, `asn=`, `country=`, `path=`, `path regex=`, `ua=`, `header.X=`,
-`method=`, `protocol=`, `reputation=`, `time=`, combinable with `AND`/`OR`/
-`NOT` and parentheses). It is parsed into `RuleMatch` at runtime. Same syntax
-for the CLI `--match` and `rules test`.
+The `match` DSL is a **declarative mini-language** used in `sentry.toml`
+(`[[rules.custom]]` and `[[policy.override]]`) and on the CLI (`sentry
+rules add --match`, `sentry rules test`). The
+[parser](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules/dsl.rs#L36)
+is a recursive-descent translator from text to the
+[`RuleMatch`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L358)
+tree evaluated by the rules engine.
 
-The parser is a recursive-descent parser in `sentry-core/src/rules/dsl.rs`
-(14 tests).
+## Grammar
 
-## Supported operators
+```text
+expr     := or_expr
+or_expr  := and_expr ('OR' and_expr)*
+and_expr := not_expr ('AND' not_expr)*
+not_expr := 'NOT' not_expr | primary
+primary  := '(' expr ')' | atom
+atom     := key op value
+```
 
-| Field        | Operator  | Example                                            |
-|--------------|-----------|----------------------------------------------------|
-| IP           | `ip=`     | `ip=10.0.0.0/8`, `ip=192.168.1.1`                  |
-| ASN          | `asn=`    | `asn=14061`                                        |
-| Country      | `country=`| `country=RU`                                       |
-| Path         | `path=`   | `path=/admin/*` (glob), `path regex=^/api/.*$`     |
-| User-Agent   | `ua=`     | `ua contains sqlmap`, `ua=python-requests`         |
-| Header       | `header.X=` | `header.X-Forwarded-For contains 1.2.3.4`       |
-| Method       | `method=` | `method=POST`                                      |
-| Protocol     | `protocol=` | `protocol=Http`                                  |
-| Reputation   | `reputation=` | `reputation=Tor`, `reputation=promiscuous`, `reputation=authorized` |
-| Status       | `status=` | `status=404`                                       |
-| Time         | `time=`   | `time outside(09:00-18:00 America/Sao_Paulo)`     |
+- Logical operators are **UPPERCASE words**: `AND`, `OR`, `NOT`. The
+  tokenizer only recognizes the uppercase form — a lowercase `and` becomes
+  part of a value and fails to parse.
+- `NOT` binds tightest, then `AND`, then `OR`. Parentheses group and
+  override precedence.
+- Values are either **bare words** (they end at whitespace, parens or a
+  quote) or **quoted strings** (`"..."`) — required for patterns with
+  spaces, regexes or `=`.
 
-## String operators
+## Conditions
 
-- `equals` (default when only `=`)
-- `contains`
-- `startswith`
-- `regex=`
+| Key                 | `RuleMatch` variant                    | What it matches                                                                 |
+|---------------------|-----------------------------------------|----------------------------------------------------------------------------------|
+| `ip`                | [`Ip`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L360) | Literal IP, CIDR (`10.0.0.0/8`) or range (`10.0.0.1-10.0.0.99`). v4 and v6. |
+| `asn`               | [`Asn`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L365) | AS number (u32). Only matches when the event carries an ASN (geo enrichment). |
+| `country`           | [`Country`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L367) | ISO 3166-1 alpha-2 code, case-insensitive compare. |
+| `path`              | [`Path`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L369) | Request path, **URL-decoded** (see operators below). |
+| `method`            | [`Method`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L376) | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, `CONNECT`, `TRACE`. Unknown methods become `Other`. |
+| `status`            | [`Status`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L418) | Exact HTTP status code. Only matches when the status is known (inline edge publishes the event after the response). |
+| `query`             | [`Query`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L388) | The whole query string, with string operators. |
+| `header.<name>`     | [`Header`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L378) | Header by (case-insensitive) name + string operator. Every `http_*` token of the nginx log_format becomes a header (e.g. `header.cf-connecting-ip`). |
+| `ua` (aliases `user_agent`, `useragent`) | [`UserAgent`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L385) | User-Agent + string operator. |
+| `body`              | [`Body`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L389) | Request body when captured (inline sources). |
+| `upload_filename`   | [`UploadFilename`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L391) | (F10) fires when any multipart part declares a filename matching the operator. |
+| `protocol`          | [`Protocol`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L394) | `http`, `http3`, `tcp`, `udp`, `tls`, `other` (parsed case-insensitively). |
+| `tls_ja3`           | [`TlsFingerprint`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L397) | JA3 hash (case-insensitive). TLS handshake events only (inline edge). |
+| `tls_ja4`           | [`TlsFingerprint`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L397) | JA4 hash (case-insensitive). |
+| `tls_sni`           | [`TlsSni`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L405) | ClientHello SNI + string operator. A missing SNI never matches (the edge surfaces that as `TlsSniMismatch` instead). |
+| `reputation`        | [`Reputation`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L411) | Client IP reputation tier (values below). |
+| `bot_verified`      | [`BotVerified`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L413) | rDNS bot-verification outcome (values below). |
+| `rate`              | [`Rate`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L419) | Event count over a window and scope (syntax below). |
+| `time`              | [`Time`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L428) | Time-of-day window (see caveat below). |
 
-## Logical combinators
+### String operators
 
-- `AND` (commutative)
-- `OR`
-- `NOT`
-- Parentheses `(` `)` for grouping
+Applies to `ua`, `query`, `body`, `upload_filename`, `tls_sni` and
+`header.<name>`:
 
-## Examples
+| Operator                          | Effect                                               |
+|-----------------------------------|-------------------------------------------------------|
+| `= value` / `eq` / `equals`       | Exact equality.                                        |
+| `contains value`                  | Substring.                                             |
+| `starts_with value` / `startswith`| Prefix.                                                |
+| `regex "<pattern>"`               | Regex (Rust `regex`, linear-time). Regexes compile once per process and are cached; an invalid pattern never matches. |
+| `in "a" "b" "c"`                  | Matches any value in the list.                         |
+
+The inline `key=value` form (no operator word) is sugar for `equals`.
+
+### Path operators
+
+| Form                                        | Effect                                                      |
+|---------------------------------------------|--------------------------------------------------------------|
+| `path=/admin/*`                             | If it contains `*` → glob (`*` = any sequence, `?` = one char; case-insensitive); otherwise exact equality. |
+| `path regex "\.env"`                        | Regex over the decoded path (use `(?i)` for case-insensitivity). |
+| `path starts_with /admin` (or `startswith`, `prefix`) | Prefix.                                            |
+| `path contains wp-login`                    | Sugar for a regex with the value escaped.                    |
+
+The path is **URL-decoded before matching** (`%2e%2e%2f` = `../`,
+`+` = space), so encoding can't bypass rules. Decoding happens once per
+evaluation, shared by every `path` condition.
+
+### `reputation` values
+
+`unknown`, `clean`, `suspicious`, `malicious`, `datacenter`, `vpn`
+(aliases `proxy`, `vpn_proxy`), `tor`, `authorized`, `promiscuous`.
+
+- `authorized` — scanner contracted by the organization (e.g. your pentest
+  vendor); raises no signal — pair it with an `allow` rule.
+- `promiscuous` — scanner that publishes recon data for anyone to query;
+  each hit earns a small `PromiscuousScanner` signal (weight 10).
+
+Tiers come from [reputation feeds](/en/rules/packs#datasets-and-reputation-feeds)
+(`[[rules.feeds]] kind = "ip"` with `tier = "..."`).
+
+### `bot_verified` values
+
+| Value                  | Matches when…                                             |
+|------------------------|------------------------------------------------------------|
+| `true` / `verified`    | rDNS confirmed ([`BotStatus::Verified`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/botverify.rs#L111)). |
+| `false` / `spoofed`    | UA claims a crawler but forward-resolution failed (`Spoofed`). |
+| engine                 | Verified as that engine: `google`, `bing`, `yahoo`, `baidu`, `yandex`. |
+
+Pending/unknown **never** matches — verification only exists with
+`[bot_verification]` enabled (opt-in).
+
+### `rate`
+
+```text
+rate <count>/<window> [scope]
+```
+
+- Window: `60s`, `5m`, `1h` (default `60s`).
+- Scope: `per_ip` (default), `per_asn`, `per_path`, `global`.
+- Requires the daemon's rate-limit backend (`InMemoryRateLimiter` or
+  Redis) — without a backend the condition never matches. The bucket
+  identity includes the condition parameters, so two rules with equal
+  thresholds share a counter and different thresholds stay independent.
+- `per_asn` without an ASN on the event and `per_path` outside HTTP never
+  match.
+
+### `time`
+
+```text
+time inside(09:00-18:00 America/Sao_Paulo)
+time outside(09:00-18:00 America/Sao_Paulo)
+```
+
+The syntax **parses** but evaluation **does not implement** time windows
+yet — the condition never matches today (reserved for future work). Do not
+rely on it for enforcement.
+
+### JA3 datasets (`ja3 in`)
+
+Membership in JA3 fingerprint sets
+([`RuleMatch::Ja3In`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules.rs#L409))
+is not expressible in the textual DSL: it is born from datasets
+(`[[rules.feeds]] kind = "ja3"` or DB-backed via `sentry datasets import
+--kind ja3`), which compile the whole list into a single rule. See
+[Default Rule Packs](/en/rules/packs#datasets-and-reputation-feeds).
+
+## Parse errors
+
+The parser returns
+[`DslError`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/rules/dsl.rs#L48):
+unexpected token, missing value, missing closing parenthesis, invalid
+number/IP, unknown key or empty expression. In `[[rules.custom]]` an error
+fails only the offending rule (the name appears in the message); in
+`[[policy.override]]` the error fails config loading.
+
+## Examples by category
 
 ```toml
 [[rules.custom]]
@@ -52,18 +161,49 @@ name = "allow internal monitoring"
 priority = 1
 match = 'ip=10.0.0.0/8'
 action = "allow"
-
-[[rules.custom]]
-name = "challenge datacenter ASN outside business hours"
-priority = 20
-match = 'asn=14061 AND time outside(09:00-18:00 America/Sao_Paulo)'
-action = "challenge"
+log_level = "silent"
 
 [[rules.custom]]
 name = "block admin from RU"
 priority = 10
 match = 'country=RU AND path=/admin/*'
 action = "block"
+
+[[rules.custom]]
+name = "block scanner UA on login"
+priority = 12
+match = 'ua regex "(?i)(sqlmap|nikto|nuclei)" AND path starts_with /login'
+action = "block"
+
+[[rules.custom]]
+name = "block spoofed Googlebot"
+priority = 12
+match = 'bot_verified = "false"'
+action = "block"
+
+[[rules.custom]]
+name = "flag odd cf-connecting-ip outside US"
+priority = 20
+match = 'header.cf-connecting-ip contains "1.2.3.4" AND NOT country=US'
+action = "challenge"
+
+[[rules.custom]]
+name = "block double-extension uploads"
+priority = 15
+match = 'upload_filename contains ".php.jpg"'
+action = "block"
+
+[[rules.custom]]
+name = "block known scanner JA3"
+priority = 18
+match = 'tls_ja4 = "t13d1516h2_8daaf6152771_e5627efa2ab1"'
+action = "block"
+
+[[rules.custom]]
+name = "rate-limit 404 storms per IP"
+priority = 15
+match = 'status=404 AND rate 10/60s per_ip'
+action = "rate_limit"
 ```
 
 ## CLI usage
@@ -72,8 +212,9 @@ action = "block"
 sentry rules add --name "block admin from RU" \
     --match 'country=RU AND path=/admin/*' --action block --priority 10
 
-sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
+sentry rules test --path /admin --method GET --ip 1.2.3.4 --ua "sqlmap/1.0"
 ```
 
-`sentry rules test` simulates which rules would match a hypothetical event,
-useful to validate rules before promoting them to `enforce`.
+`sentry rules test` evaluates the expression against a hypothetical event
+(`rate` conditions without a backend and `time` never match in the
+simulation) — validate before promoting to `enforce`.
