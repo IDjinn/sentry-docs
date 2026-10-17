@@ -101,6 +101,16 @@ Posicionamento do Sentry relativo à aplicação.
 | `mode` | string | `passive` | `passive` lê logs/tráfego espelhado e age ex-post via actions; `inline` roda o reverse proxy da [`[edge]`](#edge) na frente do app e aplica vereditos antes da requisição chegar ao backend. |
 | `instance_id` | string | *(hostname)* | Rótulo de instância para métricas em deployments multi-nó (gauge `sentry_instance_info`). Vazio = deriva do hostname. |
 
+## [`[runtime]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1990)
+
+Tuning do runtime tokio (F14): quantidade de workers, pinning de CPU e prioridade de thread, aplicados quando o binário constrói o runtime — antes de qualquer comando. Tudo opcional; seção vazia = comportamento stock do tokio (um worker por core, placement do SO, prioridade padrão). Útil quando o daemon de proteção divide a máquina com o app que protege: dedique cores em vez de deixar o scheduler brigando com a aplicação.
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `worker_threads` | inteiro | `0` | Workers async do tokio (`0` = um por core). |
+| `pin_cores` | array de inteiro | `[]` | Fixa os workers nesses ids de core em ordem (workers ciclam a lista); vazio deixa o SO posicionar. |
+| `thread_priority` | string | `normal` | `idle` \| `below_normal` \| `normal` \| `above_normal` \| `high` — mapeado para nice/priority-class por plataforma; níveis acima do normal exigem privilégio no unix (falha loga warn e segue). |
+
 ## [`[storage.postgres]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L274)
 
 Conexão de persistência (Postgres via sqlx).
@@ -433,17 +443,25 @@ LLM opcional para re-score de eventos (chave via `SENTRY_LLM_KEY`). Espelha o co
 
 ## [`[edge]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1515)
 
-Edge inline (obrigatória com `[deployment] mode = "inline"`). Cadeia: client → sentry-edge → backend. O health check do upstream no startup é mandatório; vereditos aplicam antes do proxy (Block→403, RateLimit→429, Challenge→página de challenge). IPs bloqueados são negados por fast-path **antes** do pipeline e o bloqueio sobrevive a restarts.
+Edge inline (obrigatória com `[deployment] mode = "inline"`). Cadeia: client → sentry-edge → backends. O health check de startup exige ≥1 servidor saudável **por grupo de upstream** (secundário morto só gera warn — o failover cobre); vereditos aplicam antes do proxy (Block→403, RateLimit→429, Challenge→página de challenge). IPs bloqueados são negados por fast-path **antes** do pipeline e o bloqueio sobrevive a restarts.
+
+Upstreams podem ser IPs **ou hostnames** (`http://web:3000` — nomes de container Docker resolvem via DNS do compose; service names do Kubernetes idem). Requisições são roteadas por Host header para grupos por site via [`[[edge.vhosts]]`](#edgevhosts).
 
 | Campo | Tipo | Padrão | Descrição |
 | --- | --- | --- | --- |
 | `listen` | string | `0.0.0.0:80` | Endereço HTTP público. `listen = ""` desliga o listener plain (HTTPS-only). |
-| `upstream` | string | *(vazio)* | Base URL do backend protegido (ex.: `http://127.0.0.1:8080`). |
-| `health_path` | string | `/` | Path do health check obrigatório no startup. |
+| `upstream` | string | *(vazio)* | Upstream default (catch-all) (ex.: `http://127.0.0.1:8080`). |
+| `upstreams` | array de string | `[]` | Grupo default com N servidores — substitui o `upstream` e balanceia entre eles. |
+| `balance` | string | `round_robin` | Estratégia de balanceamento do grupo: `round_robin` \| `least_conn` \| `ip_hash`. |
+| `max_fails` | inteiro | `2` | Falhas de conexão dentro da janela antes de ejectar o servidor (`0` = nunca). |
+| `fail_timeout_secs` | inteiro | `30` | Janela de contagem de falhas E duração da ejeção. |
+| `response_buffering` | bool | `true` | Bufferiza respostas do upstream (habilita compressão). `false` faz stream — `text/event-stream` sempre faz stream. |
+| `upstream_timeout_secs` | inteiro | `300` | Orçamento total por request no upstream (conexão + leitura + escrita). |
+| `health_path` | string | `/` | Path do health check de startup (por grupo). |
 | `health_timeout_secs` | inteiro | `5` | Timeout do health check. |
 | `body_capture_kb` | inteiro | `0` | Bytes do corpo capturados para inspeção, em KiB (`0` = off). |
 | `challenge_backend` | string | `sentry` | Quem executa vereditos Challenge: `sentry` (PoW embutido) \| `cloudflare` (vira regra CF via API; exige action com `provider = "cloudflare"`). |
-| `tls_cert` / `tls_key` | string (caminho) | *(vazio)* | Certificado e chave TLS (build feature `edge-tls`; ambos habilitam TLS). |
+| `tls_cert` / `tls_key` | string (caminho) | *(vazio)* | Certificado e chave TLS (build feature `edge-tls`; ambos habilitam TLS) — também a chain default para hostnames sem cert de vhost. |
 | `tls_listen` | string | `0.0.0.0:443` | Bind HTTPS usado junto com `tls_cert`/`tls_key`; o `listen` plain continua de pé (80 e 443 monitorados). |
 | `tls_redirect_https` | bool | `false` | 301 de HTTP → HTTPS **depois** do pipeline (o tráfego da porta 80 segue monitorado/bloqueado). |
 | `tls_allowed_hosts` | array de string | `[]` | Hostnames aceitos no SNI do ClientHello; vazio desliga o check. SNI ausente/desconhecido pontua como probe (`TlsSniMismatch`). |
@@ -454,12 +472,37 @@ Edge inline (obrigatória com `[deployment] mode = "inline"`). Cadeia: client �
 | `upstream_connect_timeout_secs` | inteiro | `5` | Timeout de conexão do hop edge → upstream. |
 | `upstream_pool_idle` | inteiro | `32` | Conexões keepalive ociosas em pool por host de upstream. |
 | `max_concurrent_requests` | inteiro | `1024` | Máximo de requisições simultâneas (`0` = ilimitado); acima do teto, 503 imediato (error pages se aplicam). |
+| `reuseport_workers` | inteiro | `1` | Accept loops compartilhando a porta via `SO_REUSEPORT` (unix; Windows limita a `1`). |
+| `tcp_backlog` | inteiro | `0` | Backlog do listen (`0` = máximo do kernel / `somaxconn`). |
+| `tcp_nodelay` | bool | `true` | `TCP_NODELAY` nas conexões de cliente. |
+| `tcp_keepalive_secs` | inteiro | `60` | Idle do keepalive de cliente (`0` = off). |
+| `tcp_send_buffer_kb` / `tcp_recv_buffer_kb` | inteiro | `0` | `SO_SNDBUF`/`SO_RCVBUF` em KiB (`0` = padrão do sistema). |
 
 ```toml
 [edge]
 listen = "0.0.0.0:80"
 upstream = "http://127.0.0.1:8080"
+
+[edge.vhosts]
+host = "app.example.com"
+upstreams = ["http://web:3000"]
 ```
+
+### [`[[edge.vhosts]]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1735)
+
+Virtual hosts estilo nginx (F14): requisições cujo Host header casa roteiam para o grupo de upstream do próprio vhost, com balancer e health checks passivos próprios. `host` casa case-insensitive (o sufixo `:porta` é ignorado); `*.dominio` casa qualquer subdomínio (multi-label) mas não o domínio nu — semântica nginx de wildcard. Campos omitidos herdam os globals do `[edge]`. Cada vhost pode declarar `tls_cert`/`tls_key`, servidos via SNI no listener HTTPS compartilhado (o cert global continua como chain default; exige `edge-tls`).
+
+| Campo | Tipo | Padrão | Descrição |
+| --- | --- | --- | --- |
+| `host` | string | *(obrigatório)* | Host header a casar, ex. `app.example.com` ou `*.api.example.com`. |
+| `upstreams` | array de string | *(obrigatório)* | URLs dos backends do site (IP ou hostname). |
+| `balance` | string | `[edge] balance` | `round_robin` \| `least_conn` \| `ip_hash`. |
+| `max_fails` | inteiro | `[edge] max_fails` | Falhas do health check passivo antes de ejectar. |
+| `fail_timeout_secs` | inteiro | `[edge] fail_timeout_secs` | Janela de falhas / duração da ejeção. |
+| `health_path` | string | `[edge] health_path` | Override do path do health check de startup. |
+| `tls_cert` / `tls_key` | string (caminho) | *(vazio)* | Certificado do vhost servido via SNI (ambos juntos; exige o front TLS global). |
+
+Failover: falha de conexão (connect error/timeout) tenta o próximo servidor saudável do grupo (nginx `proxy_next_upstream error timeout`; resposta 5xx não é retryable) — `sentry_edge_upstream_failovers_total{vhost}` conta as retentativas, e um grupo com todos os servidores fora responde 502. Upstreams `https://` SEMPRE verificam certificado; para backends self-signed use `http://` puro na rede privada.
 
 ### [`[edge.compress]`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-core/src/config.rs#L1618)
 

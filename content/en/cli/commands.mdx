@@ -137,6 +137,53 @@ sentry routes learn --min-hits 20 --min-ips 3
 sentry routes import openapi.yaml --dry-run
 ```
 
+## Auto-detection
+
+### `sentry auto`
+
+Detects frameworks/routes and generates `sentry.auto.toml` (known routes +
+packs + suggested rules). Detection lives in the
+[`sentry-auto`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-auto)
+crate; orchestration and the HTTP probe in
+[`auto.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/auto.rs).
+
+- **With a path** (`sentry auto /var/www/app`): scans the project tree
+  (bounded walk) and extracts routes for the **nginx**, **WordPress**,
+  **Laravel**, **Next.js** and **Express** profiles.
+- **Without a path**: runs everything on its own — reads server configs
+  from disk (`/etc/nginx`, sites-enabled/conf.d) and **probes the local
+  service** on ports 80/443 (robots.txt, sitemap.xml and ~60 common
+  paths; a random sentinel path filters catch-all/SPA fallbacks).
+- **Opt-in modules**: pass `--probe` and/or `--disk` to run just one;
+  with no flags, both run.
+- **Output**: a `METHODS | PATH` table + detected frameworks and the
+  `sentry.auto.toml` written next to the resolved `sentry.toml`. **When
+  nothing is found the command prints nothing** (exit 0) and writes no
+  file.
+
+The generated file is **cascade-loaded** automatically: on every config
+load, `routes.known`, `rules.pack` and `rules.custom` from
+`sentry.auto.toml` are appended with dedupe — whatever is in your
+`sentry.toml` always wins (there is no `--merge`; the cascade replaces
+that flag).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `[ROOT]` | (none) | Project root to scan; without it, probes the local service (80/443) + disk configs. |
+| `--probe` | off | Opt-in: only the local HTTP probe. |
+| `--disk` | off | Opt-in: only on-disk config detection. |
+| `--profile <name>` | (auto) | Forces a profile (`wordpress`, `laravel`, `nextjs`, `express`, `nginx`), skipping detection. |
+| `--deep` | off | Scans the whole tree with regex (not just canonical files). tree-sitter AST stays on the backlog. |
+| `--dry-run` | off | Print only; does not write `sentry.auto.toml`. |
+| `-v` / `-vv` | off | Verbosity: scanned tree and versions (`-v`); per-file/request detail (`-vv`). |
+
+```bash
+sentry auto                        # everything: disk + 80/443 probe
+sentry auto /var/www/app --dry-run # just preview what would be detected
+sentry auto --disk                 # zero traffic: reads configs from disk
+sentry auto --profile wordpress    # force the profile and probe WP paths
+```
+
 ## Rules engine
 
 ### `sentry rules`

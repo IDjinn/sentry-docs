@@ -31,15 +31,33 @@ flowchart TD
     COMP --> C
 ```
 
-## Mandatory health check and reverse proxy
+## Health check, upstream groups and failover (F14)
 
-Startup fails if the upstream does not answer the health check
-(`health_path`, default `/`, timeout `health_timeout_secs` = 5 s) — the
-edge never comes up "protecting" a dead backend. The edge→upstream hop is
-tuned (F12.6): `connect_timeout` 5 s, a keepalive pool with
-`upstream_pool_idle` = 32 connections per host (idle 90 s, TCP keepalive
-60 s) and `tcp_nodelay` — **zero TCP handshake per request** on the
-internal hop.
+Startup requires at least one healthy server **per upstream group**
+(`health_path`, default `/`, timeout `health_timeout_secs` = 5 s) — a down
+secondary only warns (failover exists precisely for that), but a group
+with no healthy server refuses to start: the edge never comes up
+"protecting" a dead backend. The edge→upstream hop is tuned (F12.6):
+`connect_timeout` 5 s, a keepalive pool with `upstream_pool_idle` = 32
+connections per host (idle 90 s, TCP keepalive 60 s) and `tcp_nodelay` —
+**zero TCP handshake per request** on the internal hop.
+
+Requests are routed **by Host header** (h1 `Host` / h2 `:authority`) to
+per-site upstream groups — nginx `server_name` + `proxy_pass`. Each group
+load-balances (`round_robin`, `least_conn`, `ip_hash`), runs passive
+health checks (`max_fails`/`fail_timeout`: enough connection failures
+inside the window eject the server for the window) and fails over: a
+connect error/timeout retries the next healthy server once per request
+(5xx responses are not retried) — `sentry_edge_upstream_failovers_total
+{vhost}` counts the retries; a fully-down group answers 502. Upstreams may
+be hostnames (Docker container names, k8s services) — resolved through the
+system resolver at connect time.
+
+h1 upgrade requests (WebSocket) take a raw pass-through: the pipeline still
+decides first, then the edge replays the request with an h1 client,
+answers `101` and pipes both upgraded connections bidirectionally.
+`response_buffering = false` (or `text/event-stream`) streams upstream
+responses instead of buffering them, skipping compression.
 
 ## Block fast-path (BlockTable)
 

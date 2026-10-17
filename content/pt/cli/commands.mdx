@@ -136,6 +136,52 @@ sentry routes learn --min-hits 20 --min-ips 3
 sentry routes import openapi.yaml --dry-run
 ```
 
+## Auto-detecção
+
+### `sentry auto`
+
+Detecta frameworks/rotas e gera `sentry.auto.toml` (rotas conhecidas +
+packs + regras sugeridas). Detecção na crate
+[`sentry-auto`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-auto);
+orquestração e sonda HTTP em
+[`auto.rs`](https://github.com/IDjinn/sentry/blob/main/crates/sentry-cli/src/auto.rs).
+
+- **Com path** (`sentry auto /var/www/app`): escaneia a árvore do projeto
+  (walk limitado) e extrai rotas dos perfis **nginx**, **WordPress**,
+  **Laravel**, **Next.js** e **Express**.
+- **Sem path**: roda tudo sozinho — lê configs de servidor no disco
+  (`/etc/nginx`, sites-enabled/conf.d) e **sonda o serviço local** nas
+  portas 80/443 (robots.txt, sitemap.xml e ~60 paths comuns; uma path
+  sentinela aleatória descarta catch-all/SPA fallback).
+- **Módulos opt-in**: passe `--probe` e/ou `--disk` para rodar só um
+  deles; sem flags, ambos rodam.
+- **Saída**: tabela `METHODS | PATH` + frameworks detectados e o
+  `sentry.auto.toml` gravado ao lado do `sentry.toml` resolvido. **Se nada
+  for encontrado, o comando não imprime nada** (exit 0) e não escreve
+  arquivo.
+
+O arquivo gerado é **carregado em cascata** automaticamente: em todo load
+de config, `routes.known`, `rules.pack` e `rules.custom` do
+`sentry.auto.toml` são anexados com dedupe — o que você tem no
+`sentry.toml` sempre vence (não há `--merge`; a cascata substitui o flag).
+
+| Flag | Default | Descrição |
+| --- | --- | --- |
+| `[ROOT]` | (nenhum) | Raiz do projeto a escanear; sem ela, sonda o serviço local (80/443) + configs de disco. |
+| `--probe` | off | Opt-in: só a sonda HTTP local. |
+| `--disk` | off | Opt-in: só a detecção de configs em disco. |
+| `--profile <nome>` | (auto) | Força um perfil (`wordpress`, `laravel`, `nextjs`, `express`, `nginx`), pulando a detecção. |
+| `--deep` | off | Varre a árvore inteira com regex (não só arquivos canônicos). AST com tree-sitter segue no backlog. |
+| `--dry-run` | off | Só imprime; não grava `sentry.auto.toml`. |
+| `-v` / `-vv` | off | Verbosidade: árvore escaneada e versões (`-v`); detalhe por arquivo/request (`-vv`). |
+
+```bash
+sentry auto                        # tudo: disco + sonda 80/443
+sentry auto /var/www/app --dry-run # só vê o que seria detectado
+sentry auto --disk                 # sem gerar tráfego: lê configs do disco
+sentry auto --profile wordpress    # força o perfil e sonda paths de WP
+```
+
 ## Rules engine
 
 ### `sentry rules`

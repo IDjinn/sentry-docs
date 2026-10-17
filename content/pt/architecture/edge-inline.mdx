@@ -31,14 +31,33 @@ flowchart TD
     COMP --> C
 ```
 
-## Health-check obrigatório e proxy reverso
+## Health check, grupos de upstream e failover (F14)
 
-O startup falha se o upstream não responde ao health-check
-(`health_path`, default `/`, timeout `health_timeout_secs` = 5 s) — a edge
-nunca sobe "protegendo" um backend morto. O hop edge→upstream é tunado
-(F12.6): `connect_timeout` 5 s, pool de keepalive com
-`upstream_pool_idle` = 32 conexões por host (idle 90 s, TCP keepalive 60 s)
-e `tcp_nodelay` — **zero handshake TCP por request** no hop interno.
+O startup exige ≥1 servidor saudável **por grupo de upstream**
+(`health_path`, default `/`, timeout `health_timeout_secs` = 5 s) —
+secundário morto só gera warn (o failover existe exatamente para isso),
+mas grupo sem nenhum servidor saudável impede o subir: a edge nunca sobe
+"protegendo" um backend morto. O hop edge→upstream é tunado (F12.6):
+`connect_timeout` 5 s, pool de keepalive com `upstream_pool_idle` = 32
+conexões por host (idle 90 s, TCP keepalive 60 s) e `tcp_nodelay` —
+**zero handshake TCP por request** no hop interno.
+
+As requisições são roteadas **por Host header** (h1 `Host` / h2
+`:authority`) para grupos de upstream por site — nginx `server_name` +
+`proxy_pass`. Cada grupo balanceia (`round_robin`, `least_conn`,
+`ip_hash`), roda health checks passivos (`max_fails`/`fail_timeout`:
+falhas de conexão suficientes na janela ejectam o servidor pela janela) e
+faz failover: erro de conexão/timeout tenta o próximo servidor saudável
+uma vez por request (5xx não é retryable) — `sentry_edge_upstream_failovers_total{vhost}`
+conta as retentativas; grupo todo morto responde 502. Upstreams podem ser
+hostnames (nomes de container Docker, services k8s) — resolvidos pelo
+resolver do sistema na conexão.
+
+Requests de upgrade h1 (WebSocket) seguem por pass-through cru: o pipeline
+decide primeiro, a edge repassa a requisição com um client h1, responde
+`101` e pipeia as duas conexões upgraded bidirecionalmente.
+`response_buffering = false` (ou `text/event-stream`) faz stream das
+respostas em vez de bufferizar, pulando a compressão.
 
 ## Fast-path de bloqueio (BlockTable)
 
